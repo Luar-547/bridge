@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v52
+2060 SOUND ARCHIVE - GPT Bridge Server v53
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -24,8 +24,9 @@ IMAGE_MODEL=os.getenv('OPENAI_IMAGE_MODEL','gpt-image-2').strip()
 ENABLE_IMAGE_GEN=os.getenv('ENABLE_IMAGE_GEN','true').lower()=='true'
 ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true'
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
+LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v52')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v53')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -68,16 +69,56 @@ def call_text(p):
         r=client.responses.create(model=TEXT_MODEL,input=p); return getattr(r,'output_text',None) or p
     except Exception:return p
 def gen_image(p,record,suffix='thumbnail'):
-    if not ENABLE_IMAGE_GEN or not client:return ''
+    global LAST_IMAGE_ERROR
+
+    if not ENABLE_IMAGE_GEN:
+        LAST_IMAGE_ERROR='ENABLE_IMAGE_GEN=false'
+        return '',LAST_IMAGE_ERROR
+
+    if not client:
+        LAST_IMAGE_ERROR='OpenAI client unavailable: OPENAI_API_KEY missing or openai package unavailable'
+        return '',LAST_IMAGE_ERROR
+
+    if not PUBLIC_BASE_URL:
+        LAST_IMAGE_ERROR='PUBLIC_BASE_URL is not configured'
+        return '',LAST_IMAGE_ERROR
+
     try:
-        r=client.images.generate(model=IMAGE_MODEL,prompt=p,size='1536x1024')
-        b64=getattr(r.data[0],'b64_json',None)
-        if not b64:return ''
+        r=client.images.generate(
+            model=IMAGE_MODEL,
+            prompt=p,
+            size='1536x1024'
+        )
+
+        if not getattr(r,'data',None):
+            LAST_IMAGE_ERROR='Image API returned no data'
+            return '',LAST_IMAGE_ERROR
+
+        item=r.data[0]
+        b64=getattr(item,'b64_json',None)
+        remote_url=getattr(item,'url',None)
+
         fn=f'{record}_{suffix}.png'
-        (IMAGES_DIR/fn).write_bytes(base64.b64decode(b64))
-        return f'{PUBLIC_BASE_URL}/files/{fn}' if PUBLIC_BASE_URL else ''
-    except Exception:
-        return ''
+        target=IMAGES_DIR/fn
+
+        if b64:
+            target.write_bytes(base64.b64decode(b64))
+        elif remote_url:
+            import urllib.request
+            urllib.request.urlretrieve(remote_url,target)
+        else:
+            LAST_IMAGE_ERROR='Image API response contained neither b64_json nor url'
+            return '',LAST_IMAGE_ERROR
+
+        public_url=f'{PUBLIC_BASE_URL}/files/{fn}'
+        LAST_IMAGE_ERROR=''
+        print(f'[IMAGE OK] {record} {suffix} -> {public_url}',flush=True)
+        return public_url,''
+
+    except Exception as e:
+        LAST_IMAGE_ERROR=f'{type(e).__name__}: {e}'
+        print(f'[IMAGE ERROR] {record} {suffix}: {LAST_IMAGE_ERROR}',flush=True)
+        return '',LAST_IMAGE_ERROR
 
 def scene_image_prompt(d,scene,motion_prompt):
     base=(
@@ -99,13 +140,21 @@ def scene_image_prompt(d,scene,motion_prompt):
     return base + scene_notes.get(scene,'') + ' ' + context(d) + ' Motion intent: ' + motion_prompt
 
 def gen_scene_images(d,sp):
-    if not ENABLE_SCENE_IMAGE_GEN or not ENABLE_IMAGE_GEN or not client:
-        return {}
+    if not ENABLE_SCENE_IMAGE_GEN:
+        return {},{'CONFIG':'ENABLE_SCENE_IMAGE_GEN=false'}
+
     urls={}
+    errors={}
+
     for key in ['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']:
-        prompt=scene_image_prompt(d,key,sp.get(key,''))
-        urls[key]=gen_image(prompt,d.record,f'scene_{key}')
-    return urls
+        p=scene_image_prompt(d,key,sp.get(key,''))
+        url,error=gen_image(p,d.record,f'scene_{key}')
+        if url:
+            urls[key]=url
+        if error:
+            errors[key]=error
+
+    return urls,errors
 
 def process_job(job_id):
     job=load_job(job_id)
@@ -118,8 +167,23 @@ def process_job(job_id):
     cm=common_motion(d)
     sp=scenes(d)
 
-    thumb=gen_image(tp,d.record,'thumbnail') if d.generate_thumbnail else ''
-    scene_urls=gen_scene_images(d,sp)
+    thumb=''
+    thumb_error=''
+    if d.generate_thumbnail:
+        thumb,thumb_error=gen_image(tp,d.record,'thumbnail')
+
+    scene_urls,scene_errors=gen_scene_images(d,sp)
+    generated_count=len(scene_urls)
+
+    err_parts=[]
+    if thumb_error:
+        err_parts.append('THUMB: '+thumb_error)
+    if scene_errors:
+        for k,v in list(scene_errors.items())[:3]:
+            err_parts.append(f'{k}: {v}')
+        if len(scene_errors)>3:
+            err_parts.append(f'+{len(scene_errors)-3} more')
+    err_summary=' | '.join(err_parts)
 
     result={
         'thumbnail_prompt':tp,
@@ -128,6 +192,9 @@ def process_job(job_id):
         'common_motion_prompt':cm,
         'scene_prompts':sp,
         'scene_image_urls':scene_urls,
+        'scene_image_errors':scene_errors,
+        'scene_images_generated':generated_count,
+        'image_errors_summary':err_summary[:1500],
         'mv_prompt_status':'완료' if d.generate_motion_prompts else '',
         'mv_video_url':'',
         'short_hook_url':'',
@@ -145,15 +212,19 @@ def process_job(job_id):
             'common_motion_prompt':cm,
             'scene_prompts':sp,
             'scene_image_urls':scene_urls,
+            'scene_image_errors':scene_errors,
+            'scene_images_generated':generated_count,
             'created_at':datetime.now().isoformat(timespec='seconds'),
             'status':'WAITING_VIDEO'
         }
         queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8')
         job['status']='WAITING_VIDEO'
-        result['note']='썸네일 + 장면 이미지 7장 + 프롬프트 생성 완료. Colab Worker 영상 렌더 대기.'
+        result['note']=f'프롬프트 완료 / 장면 이미지 {generated_count}/7 생성 / Colab Worker 대기'
+        if err_summary:
+            result['note']+=' / 이미지 생성 오류 있음'
     else:
         job['status']='DONE'
-        result['note']='텍스트/이미지 작업 완료.'
+        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7'
 
     save_job(job)
 
@@ -162,7 +233,7 @@ def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=Non
     check_auth(authorization); jid=uuid4().hex; job={'job_id':jid,'status':'PENDING','created_at':datetime.now().isoformat(timespec='seconds'),'request':payload.model_dump()}; save_job(job); threading.Thread(target=process_job,args=(jid,),daemon=True).start(); return {'job_id':jid,'status':'전송완료','note':'GPT Bridge 작업 접수 완료'}
 @app.get('/jobs/{job_id}')
 def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
+    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'scene_image_errors':r.get('scene_image_errors',{}),'scene_images_generated':r.get('scene_images_generated',0),'image_errors_summary':r.get('image_errors_summary',''),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
 @app.get('/video-jobs/next')
 def next_video_job(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
@@ -186,6 +257,9 @@ def auth_check(authorization:Optional[str]=Header(default=None)):
         'authenticated':True,
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
+        'openai_key_set':bool(OPENAI_API_KEY),
+        'openai_client_ready':bool(client),
+        'last_image_error':LAST_IMAGE_ERROR,
         'message':'Bridge token authentication succeeded'
     }
 
