@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v53
+2060 SOUND ARCHIVE - GPT Bridge Server v54
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +26,7 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v53')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v54')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -263,22 +263,87 @@ def auth_check(authorization:Optional[str]=Header(default=None)):
         'message':'Bridge token authentication succeeded'
     }
 
+
+@app.get('/openai-check')
+def openai_check(authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+
+    result={
+        'ok':False,
+        'server_version':'v54',
+        'model':TEXT_MODEL,
+        'openai_key_set':bool(OPENAI_API_KEY),
+        'openai_client_ready':bool(client),
+        'response':'',
+        'error_type':'',
+        'error_code':'',
+        'message':''
+    }
+
+    if not OPENAI_API_KEY:
+        result['error_type']='configuration'
+        result['message']='OPENAI_API_KEY is not set'
+        return result
+
+    if not client:
+        result['error_type']='configuration'
+        result['message']='OpenAI client is not ready'
+        return result
+
+    try:
+        r=client.responses.create(
+            model=TEXT_MODEL,
+            input='Reply with exactly: OK',
+            max_output_tokens=16
+        )
+
+        result['ok']=True
+        result['response']=getattr(r,'output_text','') or 'OK'
+        return result
+
+    except Exception as e:
+        result['error_type']=type(e).__name__
+        result['message']=str(e)
+
+        # OpenAI SDK exceptions often expose structured error details.
+        body=getattr(e,'body',None)
+        if isinstance(body,dict):
+            err=body.get('error',body)
+            if isinstance(err,dict):
+                result['error_code']=str(err.get('code') or '')
+                result['message']=str(err.get('message') or result['message'])
+
+        code=getattr(e,'code',None)
+        if code and not result['error_code']:
+            result['error_code']=str(code)
+
+        return result
+
 @app.get('/health')
 def health():
     waiting=rendering=0
     for p in JOBS_DIR.glob('*.json'):
         try:
-            s=json.loads(p.read_text(encoding='utf-8')).get('status'); waiting+=1 if s=='WAITING_VIDEO' else 0; rendering+=1 if s=='VIDEO_RENDERING' else 0
-        except:pass
+            s=json.loads(p.read_text(encoding='utf-8')).get('status')
+            waiting += 1 if s=='WAITING_VIDEO' else 0
+            rendering += 1 if s=='VIDEO_RENDERING' else 0
+        except:
+            pass
+
     return {
         'ok':True,
+        'server_version':'v54',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
+        'openai_key_set':bool(OPENAI_API_KEY),
+        'openai_client_ready':bool(client),
         'image_generation':ENABLE_IMAGE_GEN,
         'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
         'public_base_url_set':bool(PUBLIC_BASE_URL),
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
+        'last_image_error':LAST_IMAGE_ERROR,
         'video_waiting':waiting,
         'video_rendering':rendering
     }
+
