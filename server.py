@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v49
+2060 SOUND ARCHIVE - GPT Bridge Server v52
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -22,9 +22,10 @@ OPENAI_API_KEY=os.getenv('OPENAI_API_KEY','').strip()
 TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-5.6-luna').strip()
 IMAGE_MODEL=os.getenv('OPENAI_IMAGE_MODEL','gpt-image-2').strip()
 ENABLE_IMAGE_GEN=os.getenv('ENABLE_IMAGE_GEN','true').lower()=='true'
+ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true'
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v49')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v52')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -66,27 +67,102 @@ def call_text(p):
     try:
         r=client.responses.create(model=TEXT_MODEL,input=p); return getattr(r,'output_text',None) or p
     except Exception:return p
-def gen_image(p,record):
+def gen_image(p,record,suffix='thumbnail'):
     if not ENABLE_IMAGE_GEN or not client:return ''
     try:
-        r=client.images.generate(model=IMAGE_MODEL,prompt=p,size='1536x1024'); b64=getattr(r.data[0],'b64_json',None)
+        r=client.images.generate(model=IMAGE_MODEL,prompt=p,size='1536x1024')
+        b64=getattr(r.data[0],'b64_json',None)
         if not b64:return ''
-        fn=f'{record}_thumbnail.png'; (IMAGES_DIR/fn).write_bytes(base64.b64decode(b64)); return f'{PUBLIC_BASE_URL}/files/{fn}' if PUBLIC_BASE_URL else ''
-    except Exception:return ''
+        fn=f'{record}_{suffix}.png'
+        (IMAGES_DIR/fn).write_bytes(base64.b64decode(b64))
+        return f'{PUBLIC_BASE_URL}/files/{fn}' if PUBLIC_BASE_URL else ''
+    except Exception:
+        return ''
+
+def scene_image_prompt(d,scene,motion_prompt):
+    base=(
+        'Create a 16:9 cinematic anime music-video keyframe. '
+        'Adult character only. Keep one consistent protagonist design across all scenes: '
+        'same face, hairstyle, eye color, outfit, accessories, body proportions, and color palette. '
+        'Premium detailed anime illustration with realistic cinematic lighting and strong depth. '
+        'No text, no logo, no watermark, no extra limbs, no distorted hands. '
+    )
+    scene_notes={
+        'INTRO':'Opening establishing scene, wide shot, calm world introduction and atmospheric depth.',
+        'VERSE':'Narrative medium shot, natural pose, emotional storytelling, moderate energy.',
+        'PRE':'Pre-chorus build-up, anticipation, stronger light and wind, dynamic three-quarter composition.',
+        'CHORUS':'Emotional chorus climax, powerful hero shot, vivid lighting, energetic particles and depth.',
+        'BRIDGE':'Reflective bridge scene, intimate camera, emotional contrast, slightly darker atmosphere.',
+        'FINAL':'Final chorus climax, strongest heroic composition, luminous character, emotional release.',
+        'OUTRO':'Quiet ending shot, slower emotional atmosphere, lingering afterglow, cinematic closure.'
+    }
+    return base + scene_notes.get(scene,'') + ' ' + context(d) + ' Motion intent: ' + motion_prompt
+
+def gen_scene_images(d,sp):
+    if not ENABLE_SCENE_IMAGE_GEN or not ENABLE_IMAGE_GEN or not client:
+        return {}
+    urls={}
+    for key in ['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']:
+        prompt=scene_image_prompt(d,key,sp.get(key,''))
+        urls[key]=gen_image(prompt,d.record,f'scene_{key}')
+    return urls
+
 def process_job(job_id):
-    job=load_job(job_id); d=JobRequest(**job['request']); job['status']='PROCESSING'; save_job(job)
-    tp=call_text(thumb_prompt(d)); description=call_text(desc_prompt(d)); cm=common_motion(d); sp=scenes(d); img=gen_image(tp,d.record) if d.generate_thumbnail else ''
-    result={'thumbnail_prompt':tp,'thumbnail_image_url':img,'generated_description':description,'common_motion_prompt':cm,'scene_prompts':sp,'mv_prompt_status':'완료' if d.generate_motion_prompts else '','mv_video_url':'','short_hook_url':'','short_chorus_url':'','short_final_url':'','note':''}; job['result']=result
-    if d.queue_video_job:
-        q={'job_id':job_id,'record':d.record,'title':d.title,'common_motion_prompt':cm,'scene_prompts':sp,'created_at':datetime.now().isoformat(timespec='seconds'),'status':'WAITING_VIDEO'}; queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8'); job['status']='WAITING_VIDEO'; result['note']='텍스트/이미지 완료. Colab Worker 영상 렌더 대기.'
-    else:job['status']='DONE'; result['note']='텍스트/이미지 작업 완료.'
+    job=load_job(job_id)
+    d=JobRequest(**job['request'])
+    job['status']='PROCESSING'
     save_job(job)
+
+    tp=call_text(thumb_prompt(d))
+    description=call_text(desc_prompt(d))
+    cm=common_motion(d)
+    sp=scenes(d)
+
+    thumb=gen_image(tp,d.record,'thumbnail') if d.generate_thumbnail else ''
+    scene_urls=gen_scene_images(d,sp)
+
+    result={
+        'thumbnail_prompt':tp,
+        'thumbnail_image_url':thumb,
+        'generated_description':description,
+        'common_motion_prompt':cm,
+        'scene_prompts':sp,
+        'scene_image_urls':scene_urls,
+        'mv_prompt_status':'완료' if d.generate_motion_prompts else '',
+        'mv_video_url':'',
+        'short_hook_url':'',
+        'short_chorus_url':'',
+        'short_final_url':'',
+        'note':''
+    }
+    job['result']=result
+
+    if d.queue_video_job:
+        q={
+            'job_id':job_id,
+            'record':d.record,
+            'title':d.title,
+            'common_motion_prompt':cm,
+            'scene_prompts':sp,
+            'scene_image_urls':scene_urls,
+            'created_at':datetime.now().isoformat(timespec='seconds'),
+            'status':'WAITING_VIDEO'
+        }
+        queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8')
+        job['status']='WAITING_VIDEO'
+        result['note']='썸네일 + 장면 이미지 7장 + 프롬프트 생성 완료. Colab Worker 영상 렌더 대기.'
+    else:
+        job['status']='DONE'
+        result['note']='텍스트/이미지 작업 완료.'
+
+    save_job(job)
+
 @app.post('/jobs')
 def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=None)):
     check_auth(authorization); jid=uuid4().hex; job={'job_id':jid,'status':'PENDING','created_at':datetime.now().isoformat(timespec='seconds'),'request':payload.model_dump()}; save_job(job); threading.Thread(target=process_job,args=(jid,),daemon=True).start(); return {'job_id':jid,'status':'전송완료','note':'GPT Bridge 작업 접수 완료'}
 @app.get('/jobs/{job_id}')
 def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
+    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
 @app.get('/video-jobs/next')
 def next_video_job(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
@@ -125,6 +201,7 @@ def health():
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'image_generation':ENABLE_IMAGE_GEN,
+        'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
         'public_base_url_set':bool(PUBLIC_BASE_URL),
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
