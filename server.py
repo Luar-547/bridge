@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v55
+2060 SOUND ARCHIVE - GPT Bridge Server v56
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -26,11 +26,14 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v55')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v56')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
-    record:str; title:str; message:Optional[str]=''; story:Optional[str]=''; genre:Optional[str]=''; mood:Optional[str]=''; vocal:Optional[str]=''; symbol:Optional[str]=''; thumb_composition:Optional[str]=''; source_title:Optional[str]=''; source_url:Optional[str]=''; source_genre:Optional[str]=''; song_type:Optional[str]=''; target_character:Optional[str]=''; requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:bool=True
+    record:str; title:str; message:Optional[str]=''; story:Optional[str]=''; genre:Optional[str]=''; mood:Optional[str]=''; vocal:Optional[str]=''; symbol:Optional[str]=''; thumb_composition:Optional[str]=''; source_title:Optional[str]=''; source_url:Optional[str]=''; source_genre:Optional[str]=''; song_type:Optional[str]=''; target_character:Optional[str]='';
+    visual_concept:Optional[str]=''; character_lock:Optional[str]=''; background_style:Optional[str]=''; negative_elements:Optional[str]=''; base_image_rules:Optional[str]='';
+    thumbnail_boost:Optional[str]=''; scene_boost:Optional[str]=''; intro_boost:Optional[str]=''; verse_boost:Optional[str]=''; pre_boost:Optional[str]=''; chorus_boost:Optional[str]=''; bridge_boost:Optional[str]=''; final_boost:Optional[str]=''; outro_boost:Optional[str]='';
+    requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:bool=True
 class VideoCompleteRequest(BaseModel):
     mv_video_url:str; short_hook_url:Optional[str]=''; short_chorus_url:Optional[str]=''; short_final_url:Optional[str]=''; note:Optional[str]=''
 class VideoFailRequest(BaseModel):
@@ -58,11 +61,60 @@ def context(d):
     if d.story:p.append(f'Story/world: {d.story}.')
     if d.symbol:p.append(f'Visual motifs: {d.symbol}.')
     return ' '.join(p)
-def thumb_prompt(d):return ' '.join(['Create a professional YouTube music thumbnail prompt in English.','16:9 landscape, premium cinematic anime illustration, adult character only.','One strong focal subject, clean composition, dramatic lighting, high contrast.','Leave readable negative space for Korean title text; do not put text inside the generated image.','No logo, no watermark, no distorted hands, no extra fingers.',context(d),f'Preferred composition: {d.thumb_composition}.' if d.thumb_composition else '']).strip()
+
+def prompt_tuning(d):
+    p=[]
+    if d.visual_concept:p.append(f'Overall visual concept: {d.visual_concept}.')
+    if d.character_lock:p.append(f'Locked protagonist appearance: {d.character_lock}.')
+    if d.background_style:p.append(f'Background / lighting / atmosphere guidance: {d.background_style}.')
+    if d.negative_elements:p.append(f'Avoid these elements: {d.negative_elements}.')
+    if d.base_image_rules:p.append(f'Base image rules: {d.base_image_rules}.')
+    return ' '.join(p)
+
+def scene_boost_for(d,scene):
+    key={'INTRO':'intro_boost','VERSE':'verse_boost','PRE':'pre_boost','CHORUS':'chorus_boost','BRIDGE':'bridge_boost','FINAL':'final_boost','OUTRO':'outro_boost'}.get(scene,'')
+    value=getattr(d,key,'') if key else ''
+    parts=[]
+    if d.scene_boost:parts.append(f'Common scene tuning: {d.scene_boost}.')
+    if value:parts.append(f'{scene} scene tuning: {value}.')
+    return ' '.join(parts)
+
+def thumb_prompt(d):
+    parts=[
+        'Create a professional YouTube music thumbnail prompt in English.',
+        '16:9 landscape, premium cinematic anime illustration, adult character only.',
+        'One strong focal subject, clean composition, dramatic lighting, high contrast.',
+        'Leave readable negative space for Korean title text; do not put text inside the generated image.',
+        'No logo, no watermark, no distorted hands, no extra fingers.',
+        context(d), prompt_tuning(d),
+        f'Preferred composition: {d.thumb_composition}.' if d.thumb_composition else '',
+        f'Thumbnail-specific tuning: {d.thumbnail_boost}.' if d.thumbnail_boost else ''
+    ]
+    return ' '.join(x for x in parts if x).strip()
+
 def desc_prompt(d):return 'Write a concise Korean YouTube music description. Use 3-5 short paragraphs, emotional and music-first. Do not invent facts. If CrackAI source exists, mention this is an OST-like/concept song based on it. '+context(d)
-def common_motion(d):return 'The same adult female character from the reference image. Preserve the exact face, hairstyle, outfit, accessories, body proportions, and color palette. Create cinematic 3D-like motion with realistic movement, subtle breathing, blinking, hair physics, cloth physics, parallax depth, and smooth camera motion. Premium anime-to-3D look, stable anatomy, no redesign, no extra limbs, no face distortion. '+context(d)
+
+def common_motion(d):
+    return ' '.join([
+        'The same adult character from the reference image. Preserve the exact face, hairstyle, outfit, accessories, body proportions, and color palette.',
+        'Create cinematic 3D-like motion with realistic movement, subtle breathing, blinking, hair physics, cloth physics, parallax depth, and smooth camera motion.',
+        'Premium anime-to-3D look, stable anatomy, no redesign, no extra limbs, no face distortion.',
+        context(d), prompt_tuning(d),
+        f'Common scene tuning: {d.scene_boost}.' if d.scene_boost else ''
+    ])
+
 def scenes(d):
-    c=common_motion(d); s={'INTRO':'Opening establishing shot. Calm motion and gentle mood-setting camera movement.','VERSE':'Narrative verse shot. Natural body movement, moderate emotional pace, story development.','PRE':'Pre-chorus build-up. Increase anticipation, wind, particles, light intensity, and rising camera energy.','CHORUS':'Climactic chorus shot. Stronger wind, brighter light, energetic dolly/orbit motion, vivid depth.','BRIDGE':'Bridge contrast shot. More intimate or reflective camera language before the final climax.','FINAL':'Final chorus climax. Highest emotional energy, luminous character, dynamic hair and cloth, hero composition.','OUTRO':'Outro resolution. Slower softer motion, easing camera, emotional afterglow.'}; return {k:f'{c} {v}' for k,v in s.items()}
+    c=common_motion(d)
+    s={
+        'INTRO':'Opening establishing shot. Calm motion and gentle mood-setting camera movement.',
+        'VERSE':'Narrative verse shot. Natural body movement, moderate emotional pace, story development.',
+        'PRE':'Pre-chorus build-up. Increase anticipation, wind, particles, light intensity, and rising camera energy.',
+        'CHORUS':'Climactic chorus shot. Stronger wind, brighter light, energetic dolly/orbit motion, vivid depth.',
+        'BRIDGE':'Bridge contrast shot. More intimate or reflective camera language before the final climax.',
+        'FINAL':'Final chorus climax. Highest emotional energy, luminous character, dynamic hair and cloth, hero composition.',
+        'OUTRO':'Outro resolution. Slower softer motion, easing camera, emotional afterglow.'
+    }
+    return {k:' '.join([c,v,scene_boost_for(d,k)]).strip() for k,v in s.items()}
 def call_text(p):
     if not client:return p
     try:
@@ -121,13 +173,6 @@ def gen_image(p,record,suffix='thumbnail'):
         return '',LAST_IMAGE_ERROR
 
 def scene_image_prompt(d,scene,motion_prompt):
-    base=(
-        'Create a 16:9 cinematic anime music-video keyframe. '
-        'Adult character only. Keep one consistent protagonist design across all scenes: '
-        'same face, hairstyle, eye color, outfit, accessories, body proportions, and color palette. '
-        'Premium detailed anime illustration with realistic cinematic lighting and strong depth. '
-        'No text, no logo, no watermark, no extra limbs, no distorted hands. '
-    )
     scene_notes={
         'INTRO':'Opening establishing scene, wide shot, calm world introduction and atmospheric depth.',
         'VERSE':'Narrative medium shot, natural pose, emotional storytelling, moderate energy.',
@@ -137,7 +182,16 @@ def scene_image_prompt(d,scene,motion_prompt):
         'FINAL':'Final chorus climax, strongest heroic composition, luminous character, emotional release.',
         'OUTRO':'Quiet ending shot, slower emotional atmosphere, lingering afterglow, cinematic closure.'
     }
-    return base + scene_notes.get(scene,'') + ' ' + context(d) + ' Motion intent: ' + motion_prompt
+    parts=[
+        'Create a 16:9 cinematic anime music-video keyframe.',
+        'Adult character only.',
+        'Keep one consistent protagonist design across all scenes: same face, hairstyle, eye color, outfit, accessories, body proportions, and color palette.',
+        'Premium detailed anime illustration with realistic cinematic lighting and strong depth.',
+        'No text, no logo, no watermark, no extra limbs, no distorted hands.',
+        context(d), prompt_tuning(d), scene_notes.get(scene,''), scene_boost_for(d,scene),
+        'Motion intent: '+motion_prompt
+    ]
+    return ' '.join(x for x in parts if x).strip()
 
 def gen_scene_images(d,sp):
     if not ENABLE_SCENE_IMAGE_GEN:
@@ -270,7 +324,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v55',
+        'server_version':'v56',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -332,7 +386,7 @@ def health():
 
     return {
         'ok':True,
-        'server_version':'v55',
+        'server_version':'v56',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
