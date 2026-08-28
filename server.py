@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v54
+2060 SOUND ARCHIVE - GPT Bridge Server v55
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +26,7 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v54')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v55')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -270,7 +270,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v54',
+        'server_version':'v55',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -332,7 +332,7 @@ def health():
 
     return {
         'ok':True,
-        'server_version':'v54',
+        'server_version':'v55',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
