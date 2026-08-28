@@ -101,6 +101,18 @@ def complete_video_job(job_id:str,payload:VideoCompleteRequest,authorization:Opt
 @app.post('/video-jobs/{job_id}/fail')
 def fail_video_job(job_id:str,payload:VideoFailRequest,authorization:Optional[str]=Header(default=None)):
     check_auth(authorization); j=load_job(job_id); j['status']='FAILED'; j.setdefault('result',{})['note']=payload.note; save_job(j); return {'ok':True,'status':'FAILED'}
+
+@app.get('/auth-check')
+def auth_check(authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    return {
+        'ok':True,
+        'authenticated':True,
+        'bridge_token_set':bool(BRIDGE_TOKEN),
+        'bridge_token_length':len(BRIDGE_TOKEN),
+        'message':'Bridge token authentication succeeded'
+    }
+
 @app.get('/health')
 def health():
     waiting=rendering=0
@@ -108,4 +120,14 @@ def health():
         try:
             s=json.loads(p.read_text(encoding='utf-8')).get('status'); waiting+=1 if s=='WAITING_VIDEO' else 0; rendering+=1 if s=='VIDEO_RENDERING' else 0
         except:pass
-    return {'ok':True,'text_model':TEXT_MODEL,'image_model':IMAGE_MODEL,'image_generation':ENABLE_IMAGE_GEN,'public_base_url_set':bool(PUBLIC_BASE_URL),'video_waiting':waiting,'video_rendering':rendering}
+    return {
+        'ok':True,
+        'text_model':TEXT_MODEL,
+        'image_model':IMAGE_MODEL,
+        'image_generation':ENABLE_IMAGE_GEN,
+        'public_base_url_set':bool(PUBLIC_BASE_URL),
+        'bridge_token_set':bool(BRIDGE_TOKEN),
+        'bridge_token_length':len(BRIDGE_TOKEN),
+        'video_waiting':waiting,
+        'video_rendering':rendering
+    }
