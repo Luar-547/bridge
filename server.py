@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v56
+2060 SOUND ARCHIVE - GPT Bridge Server v63
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
-import base64, json, os, threading
+import base64, json, os, threading, re, urllib.request, urllib.parse
 try:
     from openai import OpenAI
 except Exception:
@@ -26,13 +26,15 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v56')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v63')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
     record:str; title:str; message:Optional[str]=''; story:Optional[str]=''; genre:Optional[str]=''; mood:Optional[str]=''; vocal:Optional[str]=''; symbol:Optional[str]=''; thumb_composition:Optional[str]=''; source_title:Optional[str]=''; source_url:Optional[str]=''; source_genre:Optional[str]=''; song_type:Optional[str]=''; target_character:Optional[str]='';
     visual_concept:Optional[str]=''; character_lock:Optional[str]=''; background_style:Optional[str]=''; negative_elements:Optional[str]=''; base_image_rules:Optional[str]='';
     thumbnail_boost:Optional[str]=''; scene_boost:Optional[str]=''; intro_boost:Optional[str]=''; verse_boost:Optional[str]=''; pre_boost:Optional[str]=''; chorus_boost:Optional[str]=''; bridge_boost:Optional[str]=''; final_boost:Optional[str]=''; outro_boost:Optional[str]='';
+    character_reference_url:Optional[str]=''; character_reference_b64:Optional[str]=''; character_reference_mime:Optional[str]=''; character_reference_name:Optional[str]='';
+    quality_check:bool=True; quality_threshold:int=82; max_regenerations:int=1;
     requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:bool=True
 class VideoCompleteRequest(BaseModel):
     mv_video_url:str; short_hook_url:Optional[str]=''; short_chorus_url:Optional[str]=''; short_final_url:Optional[str]=''; note:Optional[str]=''
@@ -120,57 +122,136 @@ def call_text(p):
     try:
         r=client.responses.create(model=TEXT_MODEL,input=p); return getattr(r,'output_text',None) or p
     except Exception:return p
-def gen_image(p,record,suffix='thumbnail'):
+
+def safe_ext_from_mime(mime,name=''):
+    m=(mime or '').lower()
+    n=(name or '').lower()
+    if 'jpeg' in m or n.endswith('.jpg') or n.endswith('.jpeg'):return '.jpg'
+    if 'webp' in m or n.endswith('.webp'):return '.webp'
+    return '.png'
+
+def prepare_character_reference(d):
+    if not PUBLIC_BASE_URL:
+        return None,''
+    try:
+        raw=None
+        mime=d.character_reference_mime or 'image/png'
+        name=d.character_reference_name or 'character_reference.png'
+        if d.character_reference_b64:
+            raw=base64.b64decode(d.character_reference_b64)
+        elif d.character_reference_url:
+            req=urllib.request.Request(d.character_reference_url,headers={'User-Agent':'Mozilla/5.0'})
+            with urllib.request.urlopen(req,timeout=45) as resp:
+                raw=resp.read()
+                mime=resp.headers.get_content_type() or mime
+                name=Path(urllib.parse.urlparse(d.character_reference_url).path).name or name
+        if not raw:
+            return None,''
+        ext=safe_ext_from_mime(mime,name)
+        path=IMAGES_DIR/f'{d.record}_character_reference{ext}'
+        path.write_bytes(raw)
+        url=f'{PUBLIC_BASE_URL}/files/{path.name}'
+        return path,url
+    except Exception as e:
+        print(f'[REFERENCE ERROR] {d.record}: {type(e).__name__}: {e}',flush=True)
+        return None,''
+
+def gen_image(p,record,suffix='thumbnail',reference_path=None):
     global LAST_IMAGE_ERROR
 
     if not ENABLE_IMAGE_GEN:
         LAST_IMAGE_ERROR='ENABLE_IMAGE_GEN=false'
         return '',LAST_IMAGE_ERROR
-
     if not client:
         LAST_IMAGE_ERROR='OpenAI client unavailable: OPENAI_API_KEY missing or openai package unavailable'
         return '',LAST_IMAGE_ERROR
-
     if not PUBLIC_BASE_URL:
         LAST_IMAGE_ERROR='PUBLIC_BASE_URL is not configured'
         return '',LAST_IMAGE_ERROR
 
     try:
-        r=client.images.generate(
-            model=IMAGE_MODEL,
-            prompt=p,
-            size='1536x1024'
-        )
+        r=None
+        if reference_path and Path(reference_path).exists():
+            ref_instruction=(
+                'Use the provided image as the identity reference for the protagonist. '
+                'Preserve the same adult character identity, face, hairstyle, eye color, outfit identity, accessories, and overall palette, '
+                'while creating the new requested composition and scene. Do not copy the original background unless requested. '
+            )
+            try:
+                with open(reference_path,'rb') as ref_file:
+                    r=client.images.edit(model=IMAGE_MODEL,image=ref_file,prompt=ref_instruction+p,size='1536x1024')
+            except Exception as edit_error:
+                print(f'[REFERENCE EDIT FALLBACK] {record} {suffix}: {type(edit_error).__name__}: {edit_error}',flush=True)
+                r=None
+        if r is None:
+            r=client.images.generate(model=IMAGE_MODEL,prompt=p,size='1536x1024')
 
         if not getattr(r,'data',None):
             LAST_IMAGE_ERROR='Image API returned no data'
             return '',LAST_IMAGE_ERROR
-
         item=r.data[0]
         b64=getattr(item,'b64_json',None)
         remote_url=getattr(item,'url',None)
-
         fn=f'{record}_{suffix}.png'
         target=IMAGES_DIR/fn
-
         if b64:
             target.write_bytes(base64.b64decode(b64))
         elif remote_url:
-            import urllib.request
             urllib.request.urlretrieve(remote_url,target)
         else:
             LAST_IMAGE_ERROR='Image API response contained neither b64_json nor url'
             return '',LAST_IMAGE_ERROR
-
         public_url=f'{PUBLIC_BASE_URL}/files/{fn}'
         LAST_IMAGE_ERROR=''
         print(f'[IMAGE OK] {record} {suffix} -> {public_url}',flush=True)
         return public_url,''
-
     except Exception as e:
         LAST_IMAGE_ERROR=f'{type(e).__name__}: {e}'
         print(f'[IMAGE ERROR] {record} {suffix}: {LAST_IMAGE_ERROR}',flush=True)
         return '',LAST_IMAGE_ERROR
+
+def extract_json_object(text):
+    s=(text or '').strip()
+    try:return json.loads(s)
+    except Exception:pass
+    m=re.search(r'\{.*\}',s,re.S)
+    if not m:return None
+    try:return json.loads(m.group(0))
+    except Exception:return None
+
+def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
+    if not d.quality_check:
+        return {'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}
+    if not client or not image_url:
+        return {'score':None,'pass':True,'issues':['QA unavailable'],'regeneration_instruction':'','qa_error':'OpenAI client or image URL unavailable'}
+    threshold=max(50,min(100,int(d.quality_threshold or 82)))
+    qa_text=(
+        'You are an image QA reviewer for an anime music-video production pipeline. '
+        f'Review the generated image labeled {label}. Score it from 0 to 100. Pass threshold is {threshold}. '
+        'Check: natural anatomy; hands/fingers/arms; face/eyes; no duplicated limbs; no unintended text/logo/watermark; '
+        'composition and cinematic depth; prompt adherence; adult appearance; clean detailed rendering. '
+        'If a character reference image is supplied, also check identity consistency: face, hairstyle, eye color, outfit identity, accessories and palette. '
+        'Return ONLY JSON with keys score (number), pass (boolean), issues (array of short strings), regeneration_instruction (short English correction prompt). '
+        f'Expected scene instructions: {expected_prompt[:2500]}'
+    )
+    content=[{'type':'input_text','text':qa_text},{'type':'input_image','image_url':image_url}]
+    if reference_url:
+        content.append({'type':'input_text','text':'The next image is the character identity reference.'})
+        content.append({'type':'input_image','image_url':reference_url})
+    try:
+        r=client.responses.create(model=TEXT_MODEL,input=[{'role':'user','content':content}])
+        raw=getattr(r,'output_text',None) or ''
+        obj=extract_json_object(raw) or {}
+        score=float(obj.get('score',0))
+        passed=bool(obj.get('pass',score>=threshold)) and score>=threshold
+        issues=obj.get('issues',[]) if isinstance(obj.get('issues',[]),list) else [str(obj.get('issues',''))]
+        instruction=str(obj.get('regeneration_instruction','')).strip()
+        return {'score':round(score,1),'pass':passed,'issues':issues[:8],'regeneration_instruction':instruction[:1200],'qa_error':''}
+    except Exception as e:
+        err=f'{type(e).__name__}: {e}'
+        print(f'[QA ERROR] {d.record} {label}: {err}',flush=True)
+        # QA failure itself should not burn image credits with blind retries.
+        return {'score':None,'pass':True,'issues':['QA service error'],'regeneration_instruction':'','qa_error':err}
 
 def scene_image_prompt(d,scene,motion_prompt):
     scene_notes={
@@ -183,103 +264,135 @@ def scene_image_prompt(d,scene,motion_prompt):
         'OUTRO':'Quiet ending shot, slower emotional atmosphere, lingering afterglow, cinematic closure.'
     }
     parts=[
-        'Create a 16:9 cinematic anime music-video keyframe.',
-        'Adult character only.',
-        'Keep one consistent protagonist design across all scenes: same face, hairstyle, eye color, outfit, accessories, body proportions, and color palette.',
+        'Create a 16:9 cinematic anime music-video keyframe.','Adult character only.',
+        'Keep one consistent protagonist design across all scenes: same face, hairstyle, eye color, outfit identity, accessories, body proportions, and color palette.',
         'Premium detailed anime illustration with realistic cinematic lighting and strong depth.',
         'No text, no logo, no watermark, no extra limbs, no distorted hands.',
-        context(d), prompt_tuning(d), scene_notes.get(scene,''), scene_boost_for(d,scene),
-        'Motion intent: '+motion_prompt
+        context(d),prompt_tuning(d),scene_notes.get(scene,''),scene_boost_for(d,scene),'Motion intent: '+motion_prompt
     ]
     return ' '.join(x for x in parts if x).strip()
 
-def gen_scene_images(d,sp):
+def generate_with_qa(d,prompt,suffix,label,reference_path=None,reference_url=''):
+    max_retry=max(0,min(2,int(d.max_regenerations or 0)))
+    attempts=0
+    final_url=''; final_error=''; final_qa={'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}
+    current_prompt=prompt
+    for attempt in range(max_retry+1):
+        attempts=attempt
+        unique_suffix=suffix if attempt==0 else f'{suffix}_retry{attempt}'
+        url,error=gen_image(current_prompt,d.record,unique_suffix,reference_path)
+        final_url,final_error=url,error
+        if not url or error:
+            break
+        final_qa=quality_check_image(url,d,label,current_prompt,reference_url)
+        if final_qa.get('pass',True):
+            break
+        if attempt<max_retry:
+            correction=final_qa.get('regeneration_instruction') or '; '.join(final_qa.get('issues') or [])
+            current_prompt=(prompt+' Regenerate this image and correct the following QA issues: '+correction+
+                            ' Preserve character identity and intended composition. Keep anatomy and hands natural. No text or watermark.')
+            print(f'[QA RETRY] {d.record} {label}: score={final_qa.get("score")} attempt={attempt+1}',flush=True)
+    return final_url,final_error,final_qa,attempts
+
+def gen_scene_images(d,sp,reference_path=None,reference_url=''):
     if not ENABLE_SCENE_IMAGE_GEN:
-        return {},{'CONFIG':'ENABLE_SCENE_IMAGE_GEN=false'}
-
-    urls={}
-    errors={}
-
+        return {},{'CONFIG':'ENABLE_SCENE_IMAGE_GEN=false'},{},0
+    urls={}; errors={}; quality={}; regen_total=0
+    consistency_ref=reference_url
     for key in ['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']:
         p=scene_image_prompt(d,key,sp.get(key,''))
-        url,error=gen_image(p,d.record,f'scene_{key}')
+        url,error,qa,retries=generate_with_qa(d,p,f'scene_{key}',key,reference_path,consistency_ref)
+        regen_total+=retries
         if url:
             urls[key]=url
-        if error:
-            errors[key]=error
-
-    return urls,errors
+            if not consistency_ref and key=='INTRO':consistency_ref=url
+        if error:errors[key]=error
+        quality[key]=qa
+    return urls,errors,quality,regen_total
 
 def process_job(job_id):
     job=load_job(job_id)
     d=JobRequest(**job['request'])
-    job['status']='PROCESSING'
-    save_job(job)
+    d.quality_threshold=max(50,min(100,int(d.quality_threshold or 82)))
+    d.max_regenerations=max(0,min(2,int(d.max_regenerations or 0)))
+    job['status']='PROCESSING'; save_job(job)
+
+    reference_path,reference_public_url=prepare_character_reference(d)
+    # Do not keep large base64 payload in persistent job JSON after reference was prepared.
+    if isinstance(job.get('request'),dict) and job['request'].get('character_reference_b64'):
+        job['request']['character_reference_b64']=''
+        save_job(job)
 
     tp=call_text(thumb_prompt(d))
     description=call_text(desc_prompt(d))
     cm=common_motion(d)
     sp=scenes(d)
 
-    thumb=''
-    thumb_error=''
+    thumb=''; thumb_error=''; thumb_qa={'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}; thumb_retries=0
     if d.generate_thumbnail:
-        thumb,thumb_error=gen_image(tp,d.record,'thumbnail')
+        thumb,thumb_error,thumb_qa,thumb_retries=generate_with_qa(d,tp,'thumbnail','THUMBNAIL',reference_path,reference_public_url)
 
-    scene_urls,scene_errors=gen_scene_images(d,sp)
+    scene_urls,scene_errors,scene_quality,scene_regens=gen_scene_images(d,sp,reference_path,reference_public_url)
     generated_count=len(scene_urls)
+    regen_total=thumb_retries+scene_regens
+
+    quality_report={'THUMBNAIL':thumb_qa,**scene_quality}
+    numeric_scores=[float(v['score']) for v in quality_report.values() if isinstance(v,dict) and v.get('score') is not None]
+    quality_average=round(sum(numeric_scores)/len(numeric_scores),1) if numeric_scores else None
+    failed_quality=[k for k,v in quality_report.items() if isinstance(v,dict) and not v.get('pass',True)]
+    qa_errors=[k for k,v in quality_report.items() if isinstance(v,dict) and v.get('qa_error')]
+    if not d.quality_check:
+        quality_status='미사용'
+    elif failed_quality:
+        quality_status='검토 필요'
+    elif qa_errors:
+        quality_status='검수 오류'
+    else:
+        quality_status='통과'
 
     err_parts=[]
-    if thumb_error:
-        err_parts.append('THUMB: '+thumb_error)
+    if thumb_error:err_parts.append('THUMB: '+thumb_error)
     if scene_errors:
-        for k,v in list(scene_errors.items())[:3]:
-            err_parts.append(f'{k}: {v}')
-        if len(scene_errors)>3:
-            err_parts.append(f'+{len(scene_errors)-3} more')
+        for k,v in list(scene_errors.items())[:3]:err_parts.append(f'{k}: {v}')
+        if len(scene_errors)>3:err_parts.append(f'+{len(scene_errors)-3} more')
     err_summary=' | '.join(err_parts)
 
     result={
-        'thumbnail_prompt':tp,
-        'thumbnail_image_url':thumb,
-        'generated_description':description,
-        'common_motion_prompt':cm,
-        'scene_prompts':sp,
-        'scene_image_urls':scene_urls,
-        'scene_image_errors':scene_errors,
-        'scene_images_generated':generated_count,
+        'thumbnail_prompt':tp,'thumbnail_image_url':thumb,'generated_description':description,
+        'common_motion_prompt':cm,'scene_prompts':sp,'scene_image_urls':scene_urls,
+        'scene_image_errors':scene_errors,'scene_images_generated':generated_count,
         'image_errors_summary':err_summary[:1500],
+        'character_reference_url':reference_public_url,
+        'image_quality_status':quality_status,'image_quality_average':quality_average,
+        'image_regenerations':regen_total,'image_quality_report':quality_report,
+        'quality_failed_scenes':failed_quality,
         'mv_prompt_status':'완료' if d.generate_motion_prompts else '',
-        'mv_video_url':'',
-        'short_hook_url':'',
-        'short_chorus_url':'',
-        'short_final_url':'',
-        'note':''
+        'mv_video_url':'','short_hook_url':'','short_chorus_url':'','short_final_url':'','note':''
     }
     job['result']=result
 
-    if d.queue_video_job:
+    quality_block=bool(d.quality_check and failed_quality)
+    if d.queue_video_job and not quality_block:
         q={
-            'job_id':job_id,
-            'record':d.record,
-            'title':d.title,
-            'common_motion_prompt':cm,
-            'scene_prompts':sp,
-            'scene_image_urls':scene_urls,
-            'scene_image_errors':scene_errors,
-            'scene_images_generated':generated_count,
-            'created_at':datetime.now().isoformat(timespec='seconds'),
-            'status':'WAITING_VIDEO'
+            'job_id':job_id,'record':d.record,'title':d.title,'common_motion_prompt':cm,
+            'scene_prompts':sp,'scene_image_urls':scene_urls,'scene_image_errors':scene_errors,
+            'scene_images_generated':generated_count,'image_quality_status':quality_status,
+            'image_quality_average':quality_average,'image_regenerations':regen_total,
+            'created_at':datetime.now().isoformat(timespec='seconds'),'status':'WAITING_VIDEO'
         }
         queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8')
         job['status']='WAITING_VIDEO'
-        result['note']=f'프롬프트 완료 / 장면 이미지 {generated_count}/7 생성 / Colab Worker 대기'
-        if err_summary:
-            result['note']+=' / 이미지 생성 오류 있음'
+        result['note']=f'프롬프트 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status}'
+        if quality_average is not None:result['note']+=f' {quality_average:.0f}점'
+        if regen_total:result['note']+=f' / 자동 재생성 {regen_total}회'
+        result['note']+=' / Colab Worker 대기'
+        if err_summary:result['note']+=' / 이미지 생성 오류 있음'
+    elif quality_block:
+        job['status']='QUALITY_REVIEW'
+        result['note']='이미지 QA 기준 미달: '+', '.join(failed_quality)+f' / 평균 {quality_average if quality_average is not None else "-"}점 / 자동 재생성 {regen_total}회. 3D 영상 변환은 보류했습니다.'
     else:
         job['status']='DONE'
-        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7'
-
+        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status}'
     save_job(job)
 
 @app.post('/jobs')
@@ -287,7 +400,7 @@ def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=Non
     check_auth(authorization); jid=uuid4().hex; job={'job_id':jid,'status':'PENDING','created_at':datetime.now().isoformat(timespec='seconds'),'request':payload.model_dump()}; save_job(job); threading.Thread(target=process_job,args=(jid,),daemon=True).start(); return {'job_id':jid,'status':'전송완료','note':'GPT Bridge 작업 접수 완료'}
 @app.get('/jobs/{job_id}')
 def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'scene_image_errors':r.get('scene_image_errors',{}),'scene_images_generated':r.get('scene_images_generated',0),'image_errors_summary':r.get('image_errors_summary',''),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
+    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'scene_image_errors':r.get('scene_image_errors',{}),'scene_images_generated':r.get('scene_images_generated',0),'image_errors_summary':r.get('image_errors_summary',''),'character_reference_url':r.get('character_reference_url',''),'image_quality_status':r.get('image_quality_status',''),'image_quality_average':r.get('image_quality_average',''),'image_regenerations':r.get('image_regenerations',0),'image_quality_report':r.get('image_quality_report',{}),'quality_failed_scenes':r.get('quality_failed_scenes',[]),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
 @app.get('/video-jobs/next')
 def next_video_job(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
@@ -324,7 +437,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v56',
+        'server_version':'v63',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -386,13 +499,15 @@ def health():
 
     return {
         'ok':True,
-        'server_version':'v56',
+        'server_version':'v63',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
         'image_generation':ENABLE_IMAGE_GEN,
         'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
+        'character_reference_support':True,
+        'image_quality_check_support':True,
         'public_base_url_set':bool(PUBLIC_BASE_URL),
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
