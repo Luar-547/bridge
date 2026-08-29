@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v64
+2060 SOUND ARCHIVE - GPT Bridge Server v67
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +26,7 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v64')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v67')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -87,7 +87,7 @@ def thumb_prompt(d):
         '16:9 landscape, premium cinematic anime illustration, adult character only.',
         'One strong focal subject, clean composition, dramatic lighting, high contrast.',
         'Leave readable negative space for Korean title text; do not put text inside the generated image.',
-        'No logo, no watermark, no distorted hands, no extra fingers.',
+        'No logo, no watermark. Every clearly visible human hand must have exactly five digits total (four fingers and one thumb), with anatomically plausible joints. No extra, missing, fused, duplicated, forked, or branching fingers; no duplicated arms or hands.',
         context(d), prompt_tuning(d),
         f'Preferred composition: {d.thumb_composition}.' if d.thumb_composition else '',
         f'Thumbnail-specific tuning: {d.thumbnail_boost}.' if d.thumbnail_boost else ''
@@ -219,19 +219,69 @@ def extract_json_object(text):
     try:return json.loads(m.group(0))
     except Exception:return None
 
+def _qa_call_json(content, purpose='QA'):
+    try:
+        r=client.responses.create(model=TEXT_MODEL,input=[{'role':'user','content':content}])
+        raw=getattr(r,'output_text',None) or ''
+        obj=extract_json_object(raw) or {}
+        return obj,''
+    except Exception as e:
+        err=f'{type(e).__name__}: {e}'
+        print(f'[{purpose} ERROR] {err}',flush=True)
+        return {},err
+
+def anatomy_check_image(image_url,d,label,reference_url=''):
+    """Dedicated hard gate for visible hands/fingers/arms before general aesthetic QA."""
+    if not client:
+        return {'pass':False,'hands_visible':0,'findings':['Anatomy QA unavailable'],'qa_error':'OpenAI client unavailable'}
+    if not image_url:
+        return {'pass':False,'hands_visible':0,'findings':['Generated image missing'],'qa_error':'Generated image missing'}
+
+    text=(
+        'You are a STRICT anatomy inspector for a production image. This is a hard safety gate, not an aesthetic review. '
+        f'Inspect the generated image labeled {label} very carefully, zooming attention conceptually to EVERY visible hand, finger, thumb, wrist, arm and limb. '
+        'Count digits on each clearly visible human hand independently. A normal clearly visible hand must have exactly five digits total: four fingers plus one thumb. '
+        'FAIL anatomy_pass if ANY clearly visible hand has six or more digits, four or fewer digits when they should be visible, duplicated fingers, fused fingers, forked/branching fingers, impossible thumb placement, malformed palm/wrist, duplicated hands, duplicated arms, or extra limbs. '
+        'Do not overlook small background hands. Do not excuse an obvious six-finger hand because the overall image looks good. '
+        'If a hand is genuinely hidden by crop, clothing, another object, perspective, or a closed fist, do not invent a digit count; mark it occluded instead. '
+        'Also fail if the face/eyes or major limb structure is clearly anatomically corrupted. '
+        'Return ONLY JSON with keys: anatomy_pass (boolean), hands_visible (integer), hand_findings (array of short strings), other_anatomy_findings (array of short strings), regeneration_instruction (short English correction prompt).'
+    )
+    content=[{'type':'input_text','text':text},{'type':'input_image','image_url':image_url}]
+    if reference_url:
+        content.append({'type':'input_text','text':'Character identity reference follows. Use it only for identity context; anatomy must be judged from the generated image.'})
+        content.append({'type':'input_image','image_url':reference_url})
+    obj,err=_qa_call_json(content,'ANATOMY QA')
+    if err:
+        return {'pass':False,'hands_visible':0,'findings':['Anatomy QA service error'],'regeneration_instruction':'','qa_error':err}
+
+    hands_visible=max(0,int(obj.get('hands_visible',0) or 0))
+    hf=obj.get('hand_findings',[]) if isinstance(obj.get('hand_findings',[]),list) else [str(obj.get('hand_findings',''))]
+    of=obj.get('other_anatomy_findings',[]) if isinstance(obj.get('other_anatomy_findings',[]),list) else [str(obj.get('other_anatomy_findings',''))]
+    findings=[str(x).strip() for x in (hf+of) if str(x).strip()][:12]
+    passed=bool(obj.get('anatomy_pass',False))
+    instruction=str(obj.get('regeneration_instruction','')).strip()
+    return {'pass':passed,'hands_visible':hands_visible,'findings':findings,'regeneration_instruction':instruction[:1200],'qa_error':''}
+
 def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
     if not d.quality_check:
-        return {'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}
+        return {'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':'','anatomy_pass':True,'hands_visible':0,'anatomy_findings':[]}
     if not client:
-        return {'score':None,'pass':False,'issues':['QA unavailable: OpenAI client unavailable'],'regeneration_instruction':'','qa_error':'OpenAI client unavailable'}
+        return {'score':None,'pass':False,'issues':['QA unavailable: OpenAI client unavailable'],'regeneration_instruction':'','qa_error':'OpenAI client unavailable','anatomy_pass':False,'hands_visible':0,'anatomy_findings':['QA unavailable']}
     if not image_url:
-        return {'score':0.0,'pass':False,'issues':['Generated image missing'],'regeneration_instruction':'Regenerate the missing image successfully before continuing.','qa_error':'Generated image missing'}
+        return {'score':0.0,'pass':False,'issues':['Generated image missing'],'regeneration_instruction':'Regenerate the missing image successfully before continuing.','qa_error':'Generated image missing','anatomy_pass':False,'hands_visible':0,'anatomy_findings':['Generated image missing']}
+
+    # Pass 1: dedicated anatomy/hands hard gate.
+    anatomy=anatomy_check_image(image_url,d,label,reference_url)
+    if anatomy.get('qa_error'):
+        return {'score':None,'pass':False,'issues':['Anatomy QA service error'],'regeneration_instruction':'','qa_error':anatomy.get('qa_error',''),'anatomy_pass':False,'hands_visible':anatomy.get('hands_visible',0),'anatomy_findings':anatomy.get('findings',[])}
+
     threshold=max(50,min(100,int(d.quality_threshold or 82)))
     qa_text=(
         'You are an image QA reviewer for an anime music-video production pipeline. '
         f'Review the generated image labeled {label}. Score it from 0 to 100. Pass threshold is {threshold}. '
-        'Check: natural anatomy; hands/fingers/arms; face/eyes; no duplicated limbs; no unintended text/logo/watermark; '
-        'composition and cinematic depth; prompt adherence; adult appearance; clean detailed rendering. '
+        'Check: natural anatomy; face/eyes; composition and cinematic depth; prompt adherence; adult appearance; clean detailed rendering; no unintended text/logo/watermark. '
+        'Hands and fingers are already checked by a separate strict anatomy gate, but mention any additional anatomy problem you notice. '
         'If a character reference image is supplied, also check identity consistency: face, hairstyle, eye color, outfit identity, accessories and palette. '
         'Return ONLY JSON with keys score (number), pass (boolean), issues (array of short strings), regeneration_instruction (short English correction prompt). '
         f'Expected scene instructions: {expected_prompt[:2500]}'
@@ -240,20 +290,37 @@ def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
     if reference_url:
         content.append({'type':'input_text','text':'The next image is the character identity reference.'})
         content.append({'type':'input_image','image_url':reference_url})
-    try:
-        r=client.responses.create(model=TEXT_MODEL,input=[{'role':'user','content':content}])
-        raw=getattr(r,'output_text',None) or ''
-        obj=extract_json_object(raw) or {}
-        score=float(obj.get('score',0))
-        passed=bool(obj.get('pass',score>=threshold)) and score>=threshold
-        issues=obj.get('issues',[]) if isinstance(obj.get('issues',[]),list) else [str(obj.get('issues',''))]
-        instruction=str(obj.get('regeneration_instruction','')).strip()
-        return {'score':round(score,1),'pass':passed,'issues':issues[:8],'regeneration_instruction':instruction[:1200],'qa_error':''}
-    except Exception as e:
-        err=f'{type(e).__name__}: {e}'
-        print(f'[QA ERROR] {d.record} {label}: {err}',flush=True)
-        # Strict QA pipeline: if QA itself cannot verify the image, do not send it to video generation.
-        return {'score':None,'pass':False,'issues':['QA service error'],'regeneration_instruction':'','qa_error':err}
+
+    obj,err=_qa_call_json(content,'GENERAL QA')
+    if err:
+        return {'score':None,'pass':False,'issues':['QA service error'],'regeneration_instruction':'','qa_error':err,'anatomy_pass':bool(anatomy.get('pass')),'hands_visible':anatomy.get('hands_visible',0),'anatomy_findings':anatomy.get('findings',[])}
+
+    score=float(obj.get('score',0))
+    general_pass=bool(obj.get('pass',score>=threshold)) and score>=threshold
+    issues=obj.get('issues',[]) if isinstance(obj.get('issues',[]),list) else [str(obj.get('issues',''))]
+    issues=[str(x).strip() for x in issues if str(x).strip()]
+    anatomy_pass=bool(anatomy.get('pass',False))
+    anatomy_findings=anatomy.get('findings',[]) or []
+
+    # HARD RULE: anatomy failure overrides any high overall score.
+    passed=bool(general_pass and anatomy_pass)
+    if not anatomy_pass:
+        issues=['HARD ANATOMY FAIL'] + list(anatomy_findings) + issues
+        score=min(score,59.0)
+
+    general_instruction=str(obj.get('regeneration_instruction','')).strip()
+    anatomy_instruction=str(anatomy.get('regeneration_instruction','')).strip()
+    instruction=' '.join(x for x in [anatomy_instruction,general_instruction] if x).strip()
+    if not anatomy_pass:
+        hard_fix='Every clearly visible human hand must have exactly five digits total: four fingers and one thumb. Correct any extra, missing, fused, duplicated, forked, or branching fingers and any malformed or duplicated hands/arms.'
+        instruction=(hard_fix+' '+instruction).strip()
+
+    return {
+        'score':round(score,1),'pass':passed,'issues':issues[:12],
+        'regeneration_instruction':instruction[:1600],'qa_error':'',
+        'anatomy_pass':anatomy_pass,'hands_visible':anatomy.get('hands_visible',0),
+        'anatomy_findings':anatomy_findings[:12]
+    }
 
 def scene_image_prompt(d,scene,motion_prompt):
     scene_notes={
@@ -269,7 +336,7 @@ def scene_image_prompt(d,scene,motion_prompt):
         'Create a 16:9 cinematic anime music-video keyframe.','Adult character only.',
         'Keep one consistent protagonist design across all scenes: same face, hairstyle, eye color, outfit identity, accessories, body proportions, and color palette.',
         'Premium detailed anime illustration with realistic cinematic lighting and strong depth.',
-        'No text, no logo, no watermark, no extra limbs, no distorted hands.',
+        'No text, no logo, no watermark. Every clearly visible human hand must have exactly five digits total (four fingers and one thumb), with natural anatomy. No extra, missing, fused, duplicated, forked, or branching fingers; no duplicated arms, hands, or limbs.',
         context(d),prompt_tuning(d),scene_notes.get(scene,''),scene_boost_for(d,scene),'Motion intent: '+motion_prompt
     ]
     return ' '.join(x for x in parts if x).strip()
@@ -292,7 +359,7 @@ def generate_with_qa(d,prompt,suffix,label,reference_path=None,reference_url='')
         if attempt<max_retry:
             correction=final_qa.get('regeneration_instruction') or '; '.join(final_qa.get('issues') or [])
             current_prompt=(prompt+' Regenerate this image and correct the following QA issues: '+correction+
-                            ' Preserve character identity and intended composition. Keep anatomy and hands natural. No text or watermark.')
+                            ' Preserve character identity and intended composition. Every clearly visible human hand must have exactly five digits total: four fingers and one thumb. No extra, missing, fused, duplicated, forked, or branching fingers. Keep wrists, arms, hands and limbs anatomically natural. No text or watermark.')
             print(f'[QA RETRY] {d.record} {label}: score={final_qa.get("score")} attempt={attempt+1}',flush=True)
     return final_url,final_error,final_qa,attempts
 
@@ -485,7 +552,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v64',
+        'server_version':'v67',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -547,7 +614,7 @@ def health():
 
     return {
         'ok':True,
-        'server_version':'v64',
+        'server_version':'v67',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
@@ -557,6 +624,8 @@ def health():
         'character_reference_support':True,
         'image_quality_check_support':True,
         'strict_image_gate':True,
+        'strict_anatomy_gate':True,
+        'two_pass_image_qa':True,
         'public_base_url_set':bool(PUBLIC_BASE_URL),
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
