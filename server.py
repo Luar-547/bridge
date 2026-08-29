@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v63
+2060 SOUND ARCHIVE - GPT Bridge Server v64
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +26,7 @@ ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
 LAST_IMAGE_ERROR=''
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v63')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v64')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -222,8 +222,10 @@ def extract_json_object(text):
 def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
     if not d.quality_check:
         return {'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}
-    if not client or not image_url:
-        return {'score':None,'pass':True,'issues':['QA unavailable'],'regeneration_instruction':'','qa_error':'OpenAI client or image URL unavailable'}
+    if not client:
+        return {'score':None,'pass':False,'issues':['QA unavailable: OpenAI client unavailable'],'regeneration_instruction':'','qa_error':'OpenAI client unavailable'}
+    if not image_url:
+        return {'score':0.0,'pass':False,'issues':['Generated image missing'],'regeneration_instruction':'Regenerate the missing image successfully before continuing.','qa_error':'Generated image missing'}
     threshold=max(50,min(100,int(d.quality_threshold or 82)))
     qa_text=(
         'You are an image QA reviewer for an anime music-video production pipeline. '
@@ -250,8 +252,8 @@ def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
     except Exception as e:
         err=f'{type(e).__name__}: {e}'
         print(f'[QA ERROR] {d.record} {label}: {err}',flush=True)
-        # QA failure itself should not burn image credits with blind retries.
-        return {'score':None,'pass':True,'issues':['QA service error'],'regeneration_instruction':'','qa_error':err}
+        # Strict QA pipeline: if QA itself cannot verify the image, do not send it to video generation.
+        return {'score':None,'pass':False,'issues':['QA service error'],'regeneration_instruction':'','qa_error':err}
 
 def scene_image_prompt(d,scene,motion_prompt):
     scene_notes={
@@ -371,8 +373,36 @@ def process_job(job_id):
     }
     job['result']=result
 
-    quality_block=bool(d.quality_check and failed_quality)
-    if d.queue_video_job and not quality_block:
+    # v64 hard safety gates: image generation must be complete before QA/video queue.
+    expected_thumb_ok=(not d.generate_thumbnail) or bool(thumb)
+    all_scenes_ok=(generated_count==7 and not scene_errors)
+    image_generation_block=bool((not expected_thumb_ok) or (not all_scenes_ok) or thumb_error)
+    quality_block=bool(d.quality_check and (failed_quality or qa_errors))
+
+    if image_generation_block or quality_block:
+        try:
+            qp=queue_path(job_id)
+            if qp.exists():qp.unlink()
+        except Exception:
+            pass
+
+    if image_generation_block:
+        job['status']='IMAGE_ERROR'
+        missing=[]
+        if d.generate_thumbnail and not thumb:missing.append('THUMBNAIL')
+        for k in ['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']:
+            if not scene_urls.get(k):missing.append(k)
+        result['quality_failed_scenes']=list(dict.fromkeys((failed_quality or [])+missing))
+        result['image_quality_status']='검수 불가'
+        result['note']=f'이미지 생성 실패 / 장면 이미지 {generated_count}/7 / Colab Worker 보류'
+        if missing:result['note']+=' / 누락: '+', '.join(missing)
+        if err_summary:result['note']+=' / 이미지 오류: '+err_summary[:900]
+    elif quality_block:
+        job['status']='QUALITY_REVIEW'
+        reason=list(dict.fromkeys((failed_quality or [])+(qa_errors or [])))
+        result['quality_failed_scenes']=reason
+        result['note']='이미지 QA 통과 실패: '+', '.join(reason)+f' / 평균 {quality_average if quality_average is not None else "-"}점 / 자동 재생성 {regen_total}회. 3D 영상 변환은 보류했습니다.'
+    elif d.queue_video_job:
         q={
             'job_id':job_id,'record':d.record,'title':d.title,'common_motion_prompt':cm,
             'scene_prompts':sp,'scene_image_urls':scene_urls,'scene_image_errors':scene_errors,
@@ -382,14 +412,10 @@ def process_job(job_id):
         }
         queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8')
         job['status']='WAITING_VIDEO'
-        result['note']=f'프롬프트 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status}'
+        result['note']=f'프롬프트 완료 / 장면 이미지 7/7 / QA {quality_status}'
         if quality_average is not None:result['note']+=f' {quality_average:.0f}점'
         if regen_total:result['note']+=f' / 자동 재생성 {regen_total}회'
         result['note']+=' / Colab Worker 대기'
-        if err_summary:result['note']+=' / 이미지 생성 오류 있음'
-    elif quality_block:
-        job['status']='QUALITY_REVIEW'
-        result['note']='이미지 QA 기준 미달: '+', '.join(failed_quality)+f' / 평균 {quality_average if quality_average is not None else "-"}점 / 자동 재생성 {regen_total}회. 3D 영상 변환은 보류했습니다.'
     else:
         job['status']='DONE'
         result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status}'
@@ -405,9 +431,31 @@ def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
 def next_video_job(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
     for p in sorted(VIDEO_JOBS_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime):
-        d=json.loads(p.read_text(encoding='utf-8')); j=load_job(d['job_id'])
-        if j.get('status')=='WAITING_VIDEO':
-            j['status']='VIDEO_RENDERING'; j.setdefault('result',{})['note']='Colab Worker가 영상 작업을 가져갔습니다.'; save_job(j); d['status']='VIDEO_RENDERING'; p.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8'); return d
+        try:
+            d=json.loads(p.read_text(encoding='utf-8'))
+            j=load_job(d['job_id'])
+            if j.get('status')!='WAITING_VIDEO':
+                continue
+            r=j.get('result',{}) or {}
+            generated=int(r.get('scene_images_generated',d.get('scene_images_generated',0)) or 0)
+            image_errors=r.get('scene_image_errors',d.get('scene_image_errors',{})) or {}
+            qa_status=str(r.get('image_quality_status',d.get('image_quality_status','')) or '')
+            if generated!=7 or image_errors or qa_status in ('검토 필요','검수 오류','검수 불가'):
+                j['status']='IMAGE_ERROR' if (generated!=7 or image_errors) else 'QUALITY_REVIEW'
+                j.setdefault('result',{})['note']=f'영상 큐 안전검사에서 보류: 장면 이미지 {generated}/7 / QA {qa_status or "미확인"}'
+                save_job(j)
+                try:p.unlink()
+                except Exception:pass
+                continue
+            j['status']='VIDEO_RENDERING'
+            j.setdefault('result',{})['note']='Colab Worker가 영상 작업을 가져갔습니다.'
+            save_job(j)
+            d['status']='VIDEO_RENDERING'
+            p.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8')
+            return d
+        except Exception as e:
+            print(f'[VIDEO QUEUE ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
+            continue
     return {'job_id':'','status':'EMPTY'}
 @app.post('/video-jobs/{job_id}/complete')
 def complete_video_job(job_id:str,payload:VideoCompleteRequest,authorization:Optional[str]=Header(default=None)):
@@ -437,7 +485,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v63',
+        'server_version':'v64',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -499,7 +547,7 @@ def health():
 
     return {
         'ok':True,
-        'server_version':'v63',
+        'server_version':'v64',
         'text_model':TEXT_MODEL,
         'image_model':IMAGE_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
@@ -508,6 +556,7 @@ def health():
         'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
         'character_reference_support':True,
         'image_quality_check_support':True,
+        'strict_image_gate':True,
         'public_base_url_set':bool(PUBLIC_BASE_URL),
         'bridge_token_set':bool(BRIDGE_TOKEN),
         'bridge_token_length':len(BRIDGE_TOKEN),
