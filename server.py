@@ -1,5 +1,5 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v67
+2060 SOUND ARCHIVE - GPT Bridge Server v78 STABLE INTEGRATED FINAL
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -8,12 +8,16 @@ from typing import Optional, Dict, Any
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
-import base64, json, os, threading, re, urllib.request, urllib.parse
+import base64, json, os, threading, re, urllib.request, urllib.parse, time, traceback
+from concurrent.futures import ThreadPoolExecutor
 try:
     from openai import OpenAI
 except Exception:
     OpenAI=None
-APP_DIR=Path(os.getenv('AI_BRIDGE_DATA_DIR','./ai_bridge_data')).resolve(); APP_DIR.mkdir(parents=True,exist_ok=True)
+SYSTEM_VERSION='v78'
+RUNTIME_ID=uuid4().hex
+DATA_DIR_ENV=os.getenv('AI_BRIDGE_DATA_DIR','').strip()
+APP_DIR=Path(DATA_DIR_ENV or './ai_bridge_data').resolve(); APP_DIR.mkdir(parents=True,exist_ok=True)
 JOBS_DIR=APP_DIR/'jobs'; JOBS_DIR.mkdir(exist_ok=True)
 IMAGES_DIR=APP_DIR/'images'; IMAGES_DIR.mkdir(exist_ok=True)
 VIDEO_JOBS_DIR=APP_DIR/'video_jobs'; VIDEO_JOBS_DIR.mkdir(exist_ok=True)
@@ -24,9 +28,31 @@ IMAGE_MODEL=os.getenv('OPENAI_IMAGE_MODEL','gpt-image-2').strip()
 ENABLE_IMAGE_GEN=os.getenv('ENABLE_IMAGE_GEN','true').lower()=='true'
 ENABLE_SCENE_IMAGE_GEN=os.getenv('ENABLE_SCENE_IMAGE_GEN','true').lower()=='true'
 PUBLIC_BASE_URL=os.getenv('PUBLIC_BASE_URL','').strip().rstrip('/')
+def env_bool(*names,default=False):
+    for name in names:
+        raw=os.getenv(name)
+        if raw is None:continue
+        return str(raw).strip().lower() in ('1','true','yes','on','y')
+    return bool(default)
+
+# v78 default: Bridge handles text/image/QA; Colab renders from Google Drive.
+DEFAULT_QUEUE_VIDEO=env_bool('DEFAULT_QUEUE_VIDEO','DEFAULT_QUEUE_VIDEO_JOB',default=False)
+ENABLE_VIDEO_QUEUE=env_bool('ENABLE_VIDEO_QUEUE',default=False)
+AUTO_RECOVER_INTERRUPTED_JOBS=env_bool('AUTO_RECOVER_INTERRUPTED_JOBS',default=False)
+VIDEO_JOB_LEASE_SECONDS=max(120,int(os.getenv('VIDEO_JOB_LEASE_SECONDS','1800') or 1800))
+JOB_RETENTION_DAYS=max(1,int(os.getenv('JOB_RETENTION_DAYS','30') or 30))
+MAX_CONCURRENT_JOBS=max(1,int(os.getenv('MAX_CONCURRENT_JOBS','1') or 1))
+JOB_EXECUTOR=ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS,thread_name_prefix='archive-job')
+STORAGE_PERSISTENT=(
+    env_bool('AI_BRIDGE_PERSISTENT','AI_BRIDGE_PERSISTENT_STORAGE',default=False)
+    or str(APP_DIR).startswith('/var/data')
+    or str(APP_DIR).startswith('/mnt/data')
+)
 LAST_IMAGE_ERROR=''
+LAST_JOB_ERROR=''
+JSON_LOCK=threading.RLock()
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v67')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v78')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
@@ -35,7 +61,7 @@ class JobRequest(BaseModel):
     thumbnail_boost:Optional[str]=''; scene_boost:Optional[str]=''; intro_boost:Optional[str]=''; verse_boost:Optional[str]=''; pre_boost:Optional[str]=''; chorus_boost:Optional[str]=''; bridge_boost:Optional[str]=''; final_boost:Optional[str]=''; outro_boost:Optional[str]='';
     character_reference_url:Optional[str]=''; character_reference_b64:Optional[str]=''; character_reference_mime:Optional[str]=''; character_reference_name:Optional[str]='';
     quality_check:bool=True; quality_threshold:int=82; max_regenerations:int=1;
-    requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:bool=True
+    requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:Optional[bool]=None; force_new:bool=False
 class VideoCompleteRequest(BaseModel):
     mv_video_url:str; short_hook_url:Optional[str]=''; short_chorus_url:Optional[str]=''; short_final_url:Optional[str]=''; note:Optional[str]=''
 class VideoFailRequest(BaseModel):
@@ -44,14 +70,158 @@ class VideoFailRequest(BaseModel):
 def check_auth(h):
     if not BRIDGE_TOKEN:return
     if (h or '').replace('Bearer ','').strip()!=BRIDGE_TOKEN:raise HTTPException(status_code=401,detail='Invalid token')
+
+def should_queue_video(request_obj):
+    requested=getattr(request_obj,'queue_video_job',None)
+    if requested is None:requested=DEFAULT_QUEUE_VIDEO
+    return bool(ENABLE_VIDEO_QUEUE and requested)
+
 def job_path(j):return JOBS_DIR/f'{j}.json'
 def queue_path(j):return VIDEO_JOBS_DIR/f'{j}.json'
+
+def atomic_write_json(path,data):
+    path=Path(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temp=path.with_name(path.name+f'.{uuid4().hex}.tmp')
+    payload=json.dumps(data,ensure_ascii=False,indent=2)
+    temp.write_text(payload,encoding='utf-8')
+    os.replace(temp,path)
+
+def read_json_file(path):
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+
 def save_job(d):
-    d['updated_at']=datetime.now().isoformat(timespec='seconds'); job_path(d['job_id']).write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8')
+    d['updated_at']=datetime.now().isoformat(timespec='seconds')
+    with JSON_LOCK:
+        atomic_write_json(job_path(d['job_id']),d)
+
 def load_job(j):
     p=job_path(j)
     if not p.exists():raise HTTPException(status_code=404,detail='Job not found')
-    return json.loads(p.read_text(encoding='utf-8'))
+    try:
+        with JSON_LOCK:return read_json_file(p)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500,detail='Job data is corrupted')
+
+def save_video_queue(d):
+    with JSON_LOCK:atomic_write_json(queue_path(d['job_id']),d)
+
+def delete_video_queue(job_id):
+    try:queue_path(job_id).unlink(missing_ok=True)
+    except Exception:pass
+
+def cleanup_old_jobs():
+    cutoff=time.time()-(JOB_RETENTION_DAYS*86400)
+    active={'PENDING','PROCESSING','WAITING_VIDEO','VIDEO_RENDERING'}
+    removed=0
+    for p in list(JOBS_DIR.glob('*.json')):
+        try:
+            if p.stat().st_mtime>=cutoff:continue
+            j=read_json_file(p)
+            if str(j.get('status') or '').upper() in active:continue
+            jid=str(j.get('job_id') or p.stem)
+            p.unlink(missing_ok=True)
+            delete_video_queue(jid)
+            removed+=1
+        except Exception:
+            continue
+    return removed
+
+def find_active_job(record):
+    target=str(record or '').strip()
+    if not target:return None
+    active={'PENDING','PROCESSING'}
+    with JSON_LOCK:
+        files=sorted(JOBS_DIR.glob('*.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+        for p in files[:500]:
+            try:
+                j=read_json_file(p)
+                req=j.get('request') or {}
+                if str(req.get('record') or '').strip()!=target:continue
+                if str(j.get('status') or '').upper() not in active:continue
+                # 서버 재시작 전 in-memory 작업은 현재 프로세스에서 실행 중이 아님.
+                # 비용 보호를 위해 자동 유료 재생성을 기본적으로 수행하지 않는다.
+                if str(j.get('runtime_id') or '')!=RUNTIME_ID:
+                    j['status']='INTERRUPTED'
+                    j.setdefault('result',{})['note']='Bridge 재시작으로 진행 중 작업이 중단되었습니다. 비용 보호를 위해 자동 재생성하지 않았습니다.'
+                    j['interrupted_at']=datetime.now().isoformat(timespec='seconds')
+                    atomic_write_json(p,j)
+                    continue
+                return j
+            except Exception:
+                continue
+    return None
+
+def parse_iso(value):
+    try:return datetime.fromisoformat(str(value or '').replace('Z','+00:00'))
+    except Exception:return None
+
+def requeue_expired_video_jobs():
+    now=datetime.now()
+    recovered=0
+    for p in list(VIDEO_JOBS_DIR.glob('*.json')):
+        try:
+            q=read_json_file(p)
+            if str(q.get('status') or '')!='VIDEO_RENDERING':continue
+            lease=parse_iso(q.get('lease_started_at'))
+            if not lease or (now-lease.replace(tzinfo=None)).total_seconds()<VIDEO_JOB_LEASE_SECONDS:continue
+            j=load_job(q['job_id'])
+            j['status']='WAITING_VIDEO'
+            j.setdefault('result',{})['note']='영상 Worker lease 만료로 자동 재대기 처리했습니다.'
+            save_job(j)
+            q['status']='WAITING_VIDEO'
+            q.pop('lease_started_at',None)
+            q.pop('lease_expires_at',None)
+            save_video_queue(q)
+            recovered+=1
+        except HTTPException:
+            try:p.unlink(missing_ok=True)
+            except Exception:pass
+        except Exception as e:
+            print(f'[LEASE RECOVERY ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
+    return recovered
+
+def recover_interrupted_jobs_on_startup():
+    """
+    Render restart leaves old PENDING/PROCESSING JSON files without a running thread.
+    Default: mark INTERRUPTED only. Automatic rerun is opt-in because it can spend image credits again.
+    """
+    interrupted=[]
+    recovered=[]
+    for p in sorted(JOBS_DIR.glob('*.json')):
+        try:
+            j=read_json_file(p)
+            status=str(j.get('status') or '').upper()
+            old_runtime=str(j.get('runtime_id') or '')
+            if status not in ('PENDING','PROCESSING'):continue
+            if old_runtime==RUNTIME_ID:continue
+
+            jid=str(j.get('job_id') or p.stem)
+            if AUTO_RECOVER_INTERRUPTED_JOBS:
+                j['status']='PENDING'
+                j['runtime_id']=RUNTIME_ID
+                j.setdefault('result',{})['note']='Bridge 시작 시 중단 Job 자동복구 대기'
+                save_job(j)
+                recovered.append(jid)
+            else:
+                j['status']='INTERRUPTED'
+                j['interrupted_at']=datetime.now().isoformat(timespec='seconds')
+                j.setdefault('result',{})['note']='Bridge 재시작으로 작업이 중단되었습니다. 자동 재생성은 비용 보호를 위해 OFF입니다.'
+                save_job(j)
+                interrupted.append(jid)
+        except Exception as e:
+            print(f'[STARTUP RECOVERY ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
+
+    for jid in recovered:
+        JOB_EXECUTOR.submit(process_job,jid)
+
+    if interrupted:
+        print(f'[STARTUP] {len(interrupted)} jobs marked INTERRUPTED (cost protection)',flush=True)
+    if recovered:
+        print(f'[STARTUP] {len(recovered)} jobs auto-recovered',flush=True)
+    return {'interrupted':len(interrupted),'recovered':len(recovered)}
+
+
 def context(d):
     p=[f'Song title: {d.title}.',f'Record: {d.record}.']
     if d.source_title:p.append(f'CrackAI source work: {d.source_title}.')
@@ -379,7 +549,7 @@ def gen_scene_images(d,sp,reference_path=None,reference_url=''):
         quality[key]=qa
     return urls,errors,quality,regen_total
 
-def process_job(job_id):
+def _process_job_impl(job_id):
     job=load_job(job_id)
     d=JobRequest(**job['request'])
     d.quality_threshold=max(50,min(100,int(d.quality_threshold or 82)))
@@ -469,7 +639,7 @@ def process_job(job_id):
         reason=list(dict.fromkeys((failed_quality or [])+(qa_errors or [])))
         result['quality_failed_scenes']=reason
         result['note']='이미지 QA 통과 실패: '+', '.join(reason)+f' / 평균 {quality_average if quality_average is not None else "-"}점 / 자동 재생성 {regen_total}회. 3D 영상 변환은 보류했습니다.'
-    elif d.queue_video_job:
+    elif should_queue_video(d):
         q={
             'job_id':job_id,'record':d.record,'title':d.title,'common_motion_prompt':cm,
             'scene_prompts':sp,'scene_image_urls':scene_urls,'scene_image_errors':scene_errors,
@@ -477,7 +647,7 @@ def process_job(job_id):
             'image_quality_average':quality_average,'image_regenerations':regen_total,
             'created_at':datetime.now().isoformat(timespec='seconds'),'status':'WAITING_VIDEO'
         }
-        queue_path(job_id).write_text(json.dumps(q,ensure_ascii=False,indent=2),encoding='utf-8')
+        save_video_queue(q)
         job['status']='WAITING_VIDEO'
         result['note']=f'프롬프트 완료 / 장면 이미지 7/7 / QA {quality_status}'
         if quality_average is not None:result['note']+=f' {quality_average:.0f}점'
@@ -485,66 +655,189 @@ def process_job(job_id):
         result['note']+=' / Colab Worker 대기'
     else:
         job['status']='DONE'
-        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status}'
+        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status} / Direct Drive 렌더 준비'
+        if bool(getattr(d,'queue_video_job',False)) and not ENABLE_VIDEO_QUEUE:
+            result['note']+=' / Bridge 영상큐는 환경설정에서 OFF'
     save_job(job)
+
+def process_job(job_id):
+    global LAST_JOB_ERROR
+    try:
+        _process_job_impl(job_id)
+        LAST_JOB_ERROR=''
+    except Exception as e:
+        LAST_JOB_ERROR=f'{type(e).__name__}: {e}'
+        print(f'[JOB ERROR] {job_id}: {LAST_JOB_ERROR}',flush=True)
+        traceback.print_exc()
+        try:
+            j=load_job(job_id)
+            j['status']='FAILED'
+            result=j.setdefault('result',{})
+            result['note']='Bridge 작업 실패: '+LAST_JOB_ERROR[:1200]
+            save_job(j)
+            delete_video_queue(job_id)
+        except Exception:
+            pass
 
 @app.post('/jobs')
 def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); jid=uuid4().hex; job={'job_id':jid,'status':'PENDING','created_at':datetime.now().isoformat(timespec='seconds'),'request':payload.model_dump()}; save_job(job); threading.Thread(target=process_job,args=(jid,),daemon=True).start(); return {'job_id':jid,'status':'전송완료','note':'GPT Bridge 작업 접수 완료'}
+    check_auth(authorization)
+    cleanup_old_jobs()
+    with JSON_LOCK:
+        if not payload.force_new:
+            existing=find_active_job(payload.record)
+            if existing:
+                return {
+                    'job_id':existing['job_id'],
+                    'status':'전송완료',
+                    'reused':True,
+                    'note':'같은 곡의 진행 중 Job을 재사용했습니다.'
+                }
+        jid=uuid4().hex
+        request_data=payload.model_dump() if hasattr(payload,'model_dump') else payload.dict()
+        request_data['queue_video_job']=should_queue_video(payload)
+        job={
+            'job_id':jid,'status':'PENDING',
+            'created_at':datetime.now().isoformat(timespec='seconds'),
+            'request':request_data,
+            'system_version':SYSTEM_VERSION,
+            'runtime_id':RUNTIME_ID
+        }
+        save_job(job)
+    JOB_EXECUTOR.submit(process_job,jid)
+    return {'job_id':jid,'status':'전송완료','reused':False,'note':'GPT Bridge 작업 접수 완료'}
+
 @app.get('/jobs/{job_id}')
 def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); r=j.get('result',{}); return {'job_id':j['job_id'],'status':j['status'],'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),'scene_image_errors':r.get('scene_image_errors',{}),'scene_images_generated':r.get('scene_images_generated',0),'image_errors_summary':r.get('image_errors_summary',''),'character_reference_url':r.get('character_reference_url',''),'image_quality_status':r.get('image_quality_status',''),'image_quality_average':r.get('image_quality_average',''),'image_regenerations':r.get('image_regenerations',0),'image_quality_report':r.get('image_quality_report',{}),'quality_failed_scenes':r.get('quality_failed_scenes',[]),'mv_prompt_status':r.get('mv_prompt_status',''),'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),'note':r.get('note','')}
+    check_auth(authorization)
+    j=load_job(job_id)
+    r=j.get('result',{})
+    return {
+        'job_id':j['job_id'],'status':j['status'],'server_version':SYSTEM_VERSION,
+        'runtime_id':str(j.get('runtime_id') or '')[:8],
+        'queue_video_job':bool((j.get('request') or {}).get('queue_video_job',False)),
+        'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),
+        'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),
+        'scene_prompts':r.get('scene_prompts',{}),'scene_image_urls':r.get('scene_image_urls',{}),
+        'scene_image_errors':r.get('scene_image_errors',{}),'scene_images_generated':r.get('scene_images_generated',0),
+        'image_errors_summary':r.get('image_errors_summary',''),'character_reference_url':r.get('character_reference_url',''),
+        'image_quality_status':r.get('image_quality_status',''),'image_quality_average':r.get('image_quality_average',''),
+        'image_regenerations':r.get('image_regenerations',0),'image_quality_report':r.get('image_quality_report',{}),
+        'quality_failed_scenes':r.get('quality_failed_scenes',[]),'mv_prompt_status':r.get('mv_prompt_status',''),
+        'mv_video_url':r.get('mv_video_url',''),'short_hook_url':r.get('short_hook_url',''),
+        'short_chorus_url':r.get('short_chorus_url',''),'short_final_url':r.get('short_final_url',''),
+        'note':r.get('note','')
+    }
 @app.get('/video-jobs/next')
 def next_video_job(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
-    for p in sorted(VIDEO_JOBS_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime):
-        try:
-            d=json.loads(p.read_text(encoding='utf-8'))
-            j=load_job(d['job_id'])
-            if j.get('status')!='WAITING_VIDEO':
-                continue
-            r=j.get('result',{}) or {}
-            generated=int(r.get('scene_images_generated',d.get('scene_images_generated',0)) or 0)
-            image_errors=r.get('scene_image_errors',d.get('scene_image_errors',{})) or {}
-            qa_status=str(r.get('image_quality_status',d.get('image_quality_status','')) or '')
-            if generated!=7 or image_errors or qa_status in ('검토 필요','검수 오류','검수 불가'):
-                j['status']='IMAGE_ERROR' if (generated!=7 or image_errors) else 'QUALITY_REVIEW'
-                j.setdefault('result',{})['note']=f'영상 큐 안전검사에서 보류: 장면 이미지 {generated}/7 / QA {qa_status or "미확인"}'
+    recovered=requeue_expired_video_jobs()
+    with JSON_LOCK:
+        for p in sorted(VIDEO_JOBS_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime):
+            try:
+                d=read_json_file(p)
+                j=load_job(d['job_id'])
+                if j.get('status')!='WAITING_VIDEO':
+                    continue
+                r=j.get('result',{}) or {}
+                generated=int(r.get('scene_images_generated',d.get('scene_images_generated',0)) or 0)
+                image_errors=r.get('scene_image_errors',d.get('scene_image_errors',{})) or {}
+                qa_status=str(r.get('image_quality_status',d.get('image_quality_status','')) or '')
+                if generated!=7 or image_errors or qa_status in ('검토 필요','검수 오류','검수 불가'):
+                    j['status']='IMAGE_ERROR' if (generated!=7 or image_errors) else 'QUALITY_REVIEW'
+                    j.setdefault('result',{})['note']=f'영상 큐 안전검사에서 보류: 장면 이미지 {generated}/7 / QA {qa_status or "미확인"}'
+                    save_job(j);delete_video_queue(j['job_id'])
+                    continue
+                lease_started=datetime.now()
+                j['status']='VIDEO_RENDERING'
+                j.setdefault('result',{})['note']='Colab Worker가 영상 작업을 가져갔습니다.'
                 save_job(j)
-                try:p.unlink()
+                d['status']='VIDEO_RENDERING'
+                d['lease_started_at']=lease_started.isoformat(timespec='seconds')
+                d['lease_expires_at']=datetime.fromtimestamp(lease_started.timestamp()+VIDEO_JOB_LEASE_SECONDS).isoformat(timespec='seconds')
+                save_video_queue(d)
+                d['lease_recovered_jobs']=recovered
+                return d
+            except HTTPException:
+                try:p.unlink(missing_ok=True)
                 except Exception:pass
+            except Exception as e:
+                print(f'[VIDEO QUEUE ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
                 continue
-            j['status']='VIDEO_RENDERING'
-            j.setdefault('result',{})['note']='Colab Worker가 영상 작업을 가져갔습니다.'
-            save_job(j)
-            d['status']='VIDEO_RENDERING'
-            p.write_text(json.dumps(d,ensure_ascii=False,indent=2),encoding='utf-8')
-            return d
-        except Exception as e:
-            print(f'[VIDEO QUEUE ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
-            continue
-    return {'job_id':'','status':'EMPTY'}
+    return {'job_id':'','status':'EMPTY','lease_recovered_jobs':recovered}
+
 @app.post('/video-jobs/{job_id}/complete')
 def complete_video_job(job_id:str,payload:VideoCompleteRequest,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); r=j.setdefault('result',{}); r['mv_video_url']=payload.mv_video_url; r['short_hook_url']=payload.short_hook_url or ''; r['short_chorus_url']=payload.short_chorus_url or ''; r['short_final_url']=payload.short_final_url or ''; r['note']=payload.note or '영상 렌더 완료'; j['status']='DONE'; save_job(j); return {'ok':True,'status':'DONE'}
+    check_auth(authorization)
+    j=load_job(job_id);r=j.setdefault('result',{})
+    r['mv_video_url']=payload.mv_video_url
+    r['short_hook_url']=payload.short_hook_url or ''
+    r['short_chorus_url']=payload.short_chorus_url or ''
+    r['short_final_url']=payload.short_final_url or ''
+    r['note']=payload.note or '영상 렌더 완료'
+    j['status']='DONE';save_job(j);delete_video_queue(job_id)
+    return {'ok':True,'status':'DONE'}
+
 @app.post('/video-jobs/{job_id}/fail')
 def fail_video_job(job_id:str,payload:VideoFailRequest,authorization:Optional[str]=Header(default=None)):
-    check_auth(authorization); j=load_job(job_id); j['status']='FAILED'; j.setdefault('result',{})['note']=payload.note; save_job(j); return {'ok':True,'status':'FAILED'}
+    check_auth(authorization)
+    j=load_job(job_id);j['status']='FAILED';j.setdefault('result',{})['note']=payload.note
+    save_job(j);delete_video_queue(job_id)
+    return {'ok':True,'status':'FAILED'}
+
+@app.post('/video-jobs/{job_id}/requeue')
+def requeue_video_job(job_id:str,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    j=load_job(job_id)
+    r=j.get('result',{}) or {}
+    if int(r.get('scene_images_generated',0) or 0)!=7:
+        raise HTTPException(status_code=409,detail='Scene images are incomplete')
+    q={
+        'job_id':job_id,'record':j.get('request',{}).get('record',''),
+        'title':j.get('request',{}).get('title',''),
+        'common_motion_prompt':r.get('common_motion_prompt',''),
+        'scene_prompts':r.get('scene_prompts',{}),
+        'scene_image_urls':r.get('scene_image_urls',{}),
+        'scene_images_generated':r.get('scene_images_generated',0),
+        'image_quality_status':r.get('image_quality_status',''),
+        'created_at':datetime.now().isoformat(timespec='seconds'),'status':'WAITING_VIDEO'
+    }
+    j['status']='WAITING_VIDEO';j.setdefault('result',{})['note']='영상 Job 수동 재대기'
+    save_job(j);save_video_queue(q)
+    return {'ok':True,'status':'WAITING_VIDEO'}
+
+@app.on_event('startup')
+def startup_event():
+    cleanup_old_jobs()
+    recover_interrupted_jobs_on_startup()
+    requeue_expired_video_jobs()
+
+@app.get('/version')
+def version():
+    return {
+        'ok':True,
+        'system_version':SYSTEM_VERSION,
+        'server_version':SYSTEM_VERSION,
+        'runtime_id':RUNTIME_ID[:8],
+        'direct_drive_recommended':True,
+        'video_queue_enabled':ENABLE_VIDEO_QUEUE,
+        'default_queue_video_job':DEFAULT_QUEUE_VIDEO
+    }
 
 @app.get('/auth-check')
 def auth_check(authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
     return {
-        'ok':True,
-        'authenticated':True,
-        'bridge_token_set':bool(BRIDGE_TOKEN),
-        'bridge_token_length':len(BRIDGE_TOKEN),
-        'openai_key_set':bool(OPENAI_API_KEY),
-        'openai_client_ready':bool(client),
-        'last_image_error':LAST_IMAGE_ERROR,
+        'ok':True,'authenticated':True,'server_version':SYSTEM_VERSION,
+        'bridge_token_set':bool(BRIDGE_TOKEN),'bridge_token_length':len(BRIDGE_TOKEN),
+        'openai_key_set':bool(OPENAI_API_KEY),'openai_client_ready':bool(client),
+        'storage_persistent':STORAGE_PERSISTENT,'persistent_storage':STORAGE_PERSISTENT,
+        'persistent_storage_configured':STORAGE_PERSISTENT,'data_dir':str(APP_DIR),
+        'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
+        'video_queue_enabled':ENABLE_VIDEO_QUEUE,'auto_recover_interrupted_jobs':AUTO_RECOVER_INTERRUPTED_JOBS,
+        'last_image_error':LAST_IMAGE_ERROR,'last_job_error':LAST_JOB_ERROR,
         'message':'Bridge token authentication succeeded'
     }
-
 
 @app.get('/openai-check')
 def openai_check(authorization:Optional[str]=Header(default=None)):
@@ -552,7 +845,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v67',
+        'server_version':'v78',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -601,36 +894,48 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
         return result
 
+@app.get('/system-info')
+def system_info(authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    return health()
+
 @app.get('/health')
 def health():
-    waiting=rendering=0
+    waiting=rendering=processing=failed=interrupted=0
+    job_count=0
     for p in JOBS_DIR.glob('*.json'):
         try:
-            s=json.loads(p.read_text(encoding='utf-8')).get('status')
+            s=str(read_json_file(p).get('status') or '')
+            job_count+=1
             waiting += 1 if s=='WAITING_VIDEO' else 0
             rendering += 1 if s=='VIDEO_RENDERING' else 0
-        except:
+            processing += 1 if s in ('PENDING','PROCESSING') else 0
+            failed += 1 if s in ('FAILED','IMAGE_ERROR','QUALITY_REVIEW') else 0
+            interrupted += 1 if s=='INTERRUPTED' else 0
+        except Exception:
             pass
 
     return {
         'ok':True,
-        'server_version':'v67',
-        'text_model':TEXT_MODEL,
-        'image_model':IMAGE_MODEL,
-        'openai_key_set':bool(OPENAI_API_KEY),
-        'openai_client_ready':bool(client),
-        'image_generation':ENABLE_IMAGE_GEN,
-        'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
-        'character_reference_support':True,
-        'image_quality_check_support':True,
-        'strict_image_gate':True,
-        'strict_anatomy_gate':True,
-        'two_pass_image_qa':True,
+        'server_version':SYSTEM_VERSION,
+        'text_model':TEXT_MODEL,'image_model':IMAGE_MODEL,
+        'openai_key_set':bool(OPENAI_API_KEY),'openai_client_ready':bool(client),
+        'image_generation':ENABLE_IMAGE_GEN,'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
+        'character_reference_support':True,'image_quality_check_support':True,
+        'strict_image_gate':True,'strict_anatomy_gate':True,'two_pass_image_qa':True,
+        'direct_drive_recommended':True,'direct_drive_mode':True,
+        'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
+        'video_queue_enabled':ENABLE_VIDEO_QUEUE,'auto_recover_interrupted_jobs':AUTO_RECOVER_INTERRUPTED_JOBS,
+        'video_job_lease_seconds':VIDEO_JOB_LEASE_SECONDS,'job_retention_days':JOB_RETENTION_DAYS,
+        'max_concurrent_jobs':MAX_CONCURRENT_JOBS,'runtime_id':RUNTIME_ID[:8],
+        'storage_persistent':STORAGE_PERSISTENT,'persistent_storage':STORAGE_PERSISTENT,
+        'persistent_storage_configured':STORAGE_PERSISTENT,'data_dir':str(APP_DIR),
+        'storage_warning':'' if STORAGE_PERSISTENT else 'Set AI_BRIDGE_DATA_DIR to a persistent disk path to prevent Job loss after redeploy.',
         'public_base_url_set':bool(PUBLIC_BASE_URL),
-        'bridge_token_set':bool(BRIDGE_TOKEN),
-        'bridge_token_length':len(BRIDGE_TOKEN),
-        'last_image_error':LAST_IMAGE_ERROR,
-        'video_waiting':waiting,
-        'video_rendering':rendering
+        'bridge_token_set':bool(BRIDGE_TOKEN),'bridge_token_length':len(BRIDGE_TOKEN),
+        'last_image_error':LAST_IMAGE_ERROR,'last_job_error':LAST_JOB_ERROR,
+        'jobs_total':job_count,'jobs_processing':processing,'jobs_failed_or_review':failed,
+        'jobs_interrupted':interrupted,
+        'video_waiting':waiting,'video_rendering':rendering
     }
 
