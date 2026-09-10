@@ -1,8 +1,9 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v82 AI IMAGE WORKFLOW
+2060 SOUND ARCHIVE - GPT Bridge Server v83 OPENART AUTO PIPELINE
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -14,13 +15,17 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI=None
-SYSTEM_VERSION='v82'
+SYSTEM_VERSION='v83'
 RUNTIME_ID=uuid4().hex
 DATA_DIR_ENV=os.getenv('AI_BRIDGE_DATA_DIR','').strip()
 APP_DIR=Path(DATA_DIR_ENV or './ai_bridge_data').resolve(); APP_DIR.mkdir(parents=True,exist_ok=True)
 JOBS_DIR=APP_DIR/'jobs'; JOBS_DIR.mkdir(exist_ok=True)
 IMAGES_DIR=APP_DIR/'images'; IMAGES_DIR.mkdir(exist_ok=True)
 VIDEO_JOBS_DIR=APP_DIR/'video_jobs'; VIDEO_JOBS_DIR.mkdir(exist_ok=True)
+OPENART_JOBS_DIR=APP_DIR/'openart_jobs'; OPENART_JOBS_DIR.mkdir(exist_ok=True)
+OPENART_INPUTS_DIR=APP_DIR/'openart_inputs'; OPENART_INPUTS_DIR.mkdir(exist_ok=True)
+OPENART_RESULTS_DIR=APP_DIR/'openart_results'; OPENART_RESULTS_DIR.mkdir(exist_ok=True)
+OPENART_WORKER_STATE_PATH=APP_DIR/'openart_worker_state.json'
 BRIDGE_TOKEN=os.getenv('AI_BRIDGE_TOKEN','').strip()
 OPENAI_API_KEY=os.getenv('OPENAI_API_KEY','').strip()
 TEXT_MODEL=os.getenv('OPENAI_TEXT_MODEL','gpt-5.6-luna').strip()
@@ -41,6 +46,12 @@ ENABLE_VIDEO_QUEUE=env_bool('ENABLE_VIDEO_QUEUE',default=False)
 AUTO_RECOVER_INTERRUPTED_JOBS=env_bool('AUTO_RECOVER_INTERRUPTED_JOBS',default=False)
 VIDEO_JOB_LEASE_SECONDS=max(120,int(os.getenv('VIDEO_JOB_LEASE_SECONDS','1800') or 1800))
 JOB_RETENTION_DAYS=max(1,int(os.getenv('JOB_RETENTION_DAYS','30') or 30))
+ENABLE_OPENART_QUEUE=env_bool('ENABLE_OPENART_QUEUE',default=True)
+OPENART_JOB_RETENTION_DAYS=max(1,int(os.getenv('OPENART_JOB_RETENTION_DAYS','14') or 14))
+OPENART_CLAIM_LEASE_SECONDS=max(120,int(os.getenv('OPENART_CLAIM_LEASE_SECONDS','1800') or 1800))
+OPENART_WORKER_OFFLINE_SECONDS=max(30,int(os.getenv('OPENART_WORKER_OFFLINE_SECONDS','120') or 120))
+OPENART_MAX_INPUT_BYTES=max(1,int(os.getenv('OPENART_MAX_INPUT_MB','12') or 12))*1024*1024
+OPENART_MAX_RESULT_BYTES=max(10,int(os.getenv('OPENART_MAX_RESULT_MB','300') or 300))*1024*1024
 MAX_CONCURRENT_JOBS=max(1,int(os.getenv('MAX_CONCURRENT_JOBS','1') or 1))
 JOB_EXECUTOR=ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS,thread_name_prefix='archive-job')
 STORAGE_PERSISTENT=(
@@ -52,8 +63,9 @@ LAST_IMAGE_ERROR=''
 LAST_JOB_ERROR=''
 JSON_LOCK=threading.RLock()
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v82')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v83')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
+app.mount('/openart-files',StaticFiles(directory=str(OPENART_RESULTS_DIR)),name='openart-files')
 
 class JobRequest(BaseModel):
     record:str
@@ -114,6 +126,52 @@ class VideoCompleteRequest(BaseModel):
 class VideoFailRequest(BaseModel):
     note:str
 
+class OpenArtJobRequest(BaseModel):
+    request_key:str
+    record:str
+    title:Optional[str]=''
+    scene:str
+    prompt:str
+    source_image_b64:str
+    source_image_mime:Optional[str]='image/png'
+    source_image_name:Optional[str]='source.png'
+    model:Optional[str]='pixverseV6'
+    duration:int=6
+    resolution:Optional[str]='1080p'
+    aspect_ratio:Optional[str]='16:9'
+    output_filename:str
+    estimated_credits:Optional[int]=0
+    force_new:bool=False
+
+class OpenArtProgressRequest(BaseModel):
+    status:str='RUNNING'
+    worker_id:Optional[str]=''
+    creation_id:Optional[str]=''
+    note:Optional[str]=''
+
+class OpenArtCompleteRequest(BaseModel):
+    result_url:str
+    worker_id:Optional[str]=''
+    creation_id:Optional[str]=''
+    note:Optional[str]=''
+    metadata:Dict[str,Any]=Field(default_factory=dict)
+
+class OpenArtFailRequest(BaseModel):
+    error:str
+    worker_id:Optional[str]=''
+    creation_id:Optional[str]=''
+    note:Optional[str]=''
+
+class OpenArtWorkerHeartbeat(BaseModel):
+    worker_id:str
+    authenticated:bool=False
+    cli_version:Optional[str]=''
+    credits:Optional[float]=None
+    status:Optional[str]='idle'
+    current_job_id:Optional[str]=''
+    note:Optional[str]=''
+
+
 def check_auth(h):
     if not BRIDGE_TOKEN:return
     if (h or '').replace('Bearer ','').strip()!=BRIDGE_TOKEN:raise HTTPException(status_code=401,detail='Invalid token')
@@ -156,6 +214,126 @@ def save_video_queue(d):
 def delete_video_queue(job_id):
     try:queue_path(job_id).unlink(missing_ok=True)
     except Exception:pass
+
+
+def openart_job_path(job_id):return OPENART_JOBS_DIR/f'{job_id}.json'
+
+def save_openart_job(data):
+    data['updated_at']=datetime.now().isoformat(timespec='seconds')
+    with JSON_LOCK:atomic_write_json(openart_job_path(data['job_id']),data)
+
+def load_openart_job(job_id):
+    p=openart_job_path(job_id)
+    if not p.exists():raise HTTPException(status_code=404,detail='OpenArt Job not found')
+    try:
+        with JSON_LOCK:return read_json_file(p)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500,detail='OpenArt Job data is corrupted')
+
+def sanitize_openart_filename(value,fallback='output.mp4'):
+    name=Path(str(value or fallback)).name
+    name=re.sub(r'[^0-9A-Za-z가-힣._-]+','_',name).strip('._')
+    if not name:name=fallback
+    return name[:180]
+
+def openart_input_path(job):
+    return OPENART_INPUTS_DIR/str(job.get('input_filename') or '')
+
+def openart_result_path(job):
+    return OPENART_RESULTS_DIR/str(job.get('stored_filename') or '')
+
+def find_active_openart_job(request_key):
+    """Return a reusable job for the same REC/scene.
+
+    Active work is reused first. A completed job is also reusable when its
+    verified result still exists, preventing accidental duplicate credit use
+    after a Sheet Job ID is cleared or lost.
+    """
+    active={'QUEUED','CLAIMED','RUNNING','DOWNLOADING'}
+    completed=None
+    for p in sorted(OPENART_JOBS_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime,reverse=True):
+        try:
+            j=read_json_file(p)
+            if str(j.get('request_key') or '')!=str(request_key or ''):
+                continue
+            status=str(j.get('status') or '').upper()
+            if status in active:
+                return j
+            if status=='COMPLETED' and completed is None:
+                result=openart_result_path(j)
+                if result.name and result.exists() and result.stat().st_size>=1024:
+                    completed=j
+        except Exception:
+            pass
+    return completed
+
+def parse_openart_worker_state():
+    try:return read_json_file(OPENART_WORKER_STATE_PATH)
+    except Exception:return {}
+
+def save_openart_worker_state(data):
+    state=dict(data or {})
+    state['updated_at']=datetime.now().isoformat(timespec='seconds')
+    state['updated_ts']=time.time()
+    atomic_write_json(OPENART_WORKER_STATE_PATH,state)
+    return state
+
+def cleanup_old_openart_jobs():
+    cutoff=time.time()-(OPENART_JOB_RETENTION_DAYS*86400)
+    active={'QUEUED','CLAIMED','RUNNING','DOWNLOADING'}
+    removed=0
+    for p in list(OPENART_JOBS_DIR.glob('*.json')):
+        try:
+            if p.stat().st_mtime>=cutoff:continue
+            j=read_json_file(p)
+            if str(j.get('status') or '').upper() in active:continue
+            ip=openart_input_path(j);rp=openart_result_path(j)
+            p.unlink(missing_ok=True)
+            if ip.name:ip.unlink(missing_ok=True)
+            if rp.name:rp.unlink(missing_ok=True)
+            removed+=1
+        except Exception:pass
+    return removed
+
+def requeue_expired_openart_jobs():
+    now=time.time();recovered=0
+    for p in list(OPENART_JOBS_DIR.glob('*.json')):
+        try:
+            j=read_json_file(p)
+            if str(j.get('status') or '').upper() not in {'CLAIMED','RUNNING','DOWNLOADING'}:continue
+            lease=float(j.get('lease_expires_ts') or 0)
+            if not lease or lease>now:continue
+            j['status']='QUEUED';j['note']='Worker lease 만료로 자동 재대기'
+            j.pop('worker_id',None);j.pop('lease_expires_ts',None)
+            save_openart_job(j);recovered+=1
+        except Exception:pass
+    return recovered
+
+def is_mp4_header(data):
+    head=bytes(data[:64] if data else b'')
+    return b'ftyp' in head or b'moov' in head or b'mdat' in head
+
+def download_openart_result(url,target):
+    temp=Path(str(target)+'.part')
+    total=0
+    req=urllib.request.Request(str(url),headers={'User-Agent':'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req,timeout=180) as resp,temp.open('wb') as out:
+            while True:
+                chunk=resp.read(1024*1024)
+                if not chunk:break
+                total+=len(chunk)
+                if total>OPENART_MAX_RESULT_BYTES:raise ValueError('OpenArt result exceeds size limit')
+                out.write(chunk)
+        if total<1024:raise ValueError('OpenArt result is empty')
+        with temp.open('rb') as f:head=f.read(64)
+        if not is_mp4_header(head):raise ValueError('OpenArt result is not a valid MP4/MOV file')
+        os.replace(temp,target)
+        return total
+    finally:
+        if temp.exists():
+            try:temp.unlink()
+            except Exception:pass
 
 def cleanup_old_jobs():
     cutoff=time.time()-(JOB_RETENTION_DAYS*86400)
@@ -1044,9 +1222,160 @@ def requeue_video_job(job_id:str,authorization:Optional[str]=Header(default=None
     save_job(j);save_video_queue(q)
     return {'ok':True,'status':'WAITING_VIDEO'}
 
+
+@app.post('/openart-jobs')
+def create_openart_job(payload:OpenArtJobRequest,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    if not ENABLE_OPENART_QUEUE:raise HTTPException(status_code=503,detail='OpenArt queue is disabled')
+    cleanup_old_openart_jobs();requeue_expired_openart_jobs()
+    if not payload.force_new:
+        active=find_active_openart_job(payload.request_key)
+        if active:
+            reused_status=str(active.get('status') or 'QUEUED').upper()
+            reused_note=(
+                'Existing completed OpenArt result reused · no new generation charge'
+                if reused_status=='COMPLETED'
+                else 'Existing active OpenArt job reused'
+            )
+            return {
+                'ok':True,'job_id':active['job_id'],'status':reused_status,
+                'estimated_credits':active.get('estimated_credits',0),'note':reused_note
+            }
+    try:image_bytes=base64.b64decode(payload.source_image_b64,validate=True)
+    except Exception:raise HTTPException(status_code=400,detail='Invalid source_image_b64')
+    if not image_bytes or len(image_bytes)>OPENART_MAX_INPUT_BYTES:
+        raise HTTPException(status_code=413,detail=f'OpenArt source image must be 1..{OPENART_MAX_INPUT_BYTES} bytes')
+    job_id='oa_'+uuid4().hex
+    ext=Path(payload.source_image_name or '').suffix.lower()
+    if ext not in ('.png','.jpg','.jpeg','.webp'):ext='.png'
+    input_filename=f'{job_id}{ext}'
+    (OPENART_INPUTS_DIR/input_filename).write_bytes(image_bytes)
+    job={
+        'job_id':job_id,'request_key':payload.request_key,'record':payload.record,'title':payload.title,
+        'scene':payload.scene,'prompt':payload.prompt,'model':payload.model or 'pixverseV6',
+        'duration':max(1,min(15,int(payload.duration or 6))),'resolution':payload.resolution or '1080p',
+        'aspect_ratio':payload.aspect_ratio or '16:9','output_filename':sanitize_openart_filename(payload.output_filename),
+        'estimated_credits':int(payload.estimated_credits or 0),'input_filename':input_filename,
+        'input_mime':payload.source_image_mime or 'image/png','input_bytes':len(image_bytes),
+        'status':'QUEUED','note':'OpenArt Worker 대기','created_at':datetime.now().isoformat(timespec='seconds')
+    }
+    save_openart_job(job)
+    return {'ok':True,'job_id':job_id,'status':'QUEUED','estimated_credits':job['estimated_credits'],'note':job['note']}
+
+@app.get('/openart-jobs/{job_id}')
+def get_openart_job(job_id:str,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id)
+    return {
+        'ok':True,'job_id':j['job_id'],'request_key':j.get('request_key',''),'record':j.get('record',''),
+        'scene':j.get('scene',''),'status':j.get('status',''),'creation_id':j.get('creation_id',''),
+        'result_url':j.get('stored_result_url',''),'estimated_credits':j.get('estimated_credits',0),
+        'note':j.get('note',''),'error':j.get('error',''),'worker_id':j.get('worker_id',''),
+        'created_at':j.get('created_at',''),'updated_at':j.get('updated_at',''),'completed_at':j.get('completed_at','')
+    }
+
+@app.get('/openart-jobs/{job_id}/input')
+def get_openart_job_input(job_id:str,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id);p=openart_input_path(j)
+    if not p.exists():raise HTTPException(status_code=404,detail='OpenArt input not found')
+    return FileResponse(str(p),media_type=j.get('input_mime') or 'application/octet-stream',filename=p.name)
+
+@app.get('/openart-jobs/next/claim')
+def claim_openart_job(worker_id:str='worker',authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    if not ENABLE_OPENART_QUEUE:return {'job_id':'','status':'DISABLED'}
+    recovered=requeue_expired_openart_jobs()
+    with JSON_LOCK:
+        for p in sorted(OPENART_JOBS_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime):
+            try:
+                j=read_json_file(p)
+                if str(j.get('status') or '').upper()!='QUEUED':continue
+                j['status']='CLAIMED';j['worker_id']=worker_id
+                j['lease_expires_ts']=time.time()+OPENART_CLAIM_LEASE_SECONDS
+                j['note']='OpenArt Worker가 작업을 가져갔습니다.'
+                save_openart_job(j)
+                return {
+                    'job_id':j['job_id'],'record':j.get('record',''),'title':j.get('title',''),'scene':j.get('scene',''),
+                    'prompt':j.get('prompt',''),'model':j.get('model','pixverseV6'),'duration':j.get('duration',6),
+                    'resolution':j.get('resolution','1080p'),'aspect_ratio':j.get('aspect_ratio','16:9'),
+                    'output_filename':j.get('output_filename','output.mp4'),
+                    'input_url':f"{PUBLIC_BASE_URL}/openart-jobs/{j['job_id']}/input" if PUBLIC_BASE_URL else f"/openart-jobs/{j['job_id']}/input",
+                    'estimated_credits':j.get('estimated_credits',0),'recovered':recovered,'status':'CLAIMED'
+                }
+            except Exception as e:
+                print(f'[OPENART CLAIM ERROR] {p.name}: {type(e).__name__}: {e}',flush=True)
+    return {'job_id':'','status':'EMPTY','recovered':recovered}
+
+@app.post('/openart-jobs/{job_id}/progress')
+def update_openart_job(job_id:str,payload:OpenArtProgressRequest,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id)
+    if str(j.get('status') or '').upper() in {'COMPLETED','FAILED','CANCELLED'}:return {'ok':True,'status':j.get('status')}
+    j['status']=str(payload.status or 'RUNNING').upper();j['worker_id']=payload.worker_id or j.get('worker_id','')
+    if payload.creation_id:j['creation_id']=payload.creation_id
+    if payload.note:j['note']=payload.note
+    j['lease_expires_ts']=time.time()+OPENART_CLAIM_LEASE_SECONDS
+    save_openart_job(j);return {'ok':True,'status':j['status']}
+
+@app.post('/openart-jobs/{job_id}/complete')
+def complete_openart_job(job_id:str,payload:OpenArtCompleteRequest,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id)
+    j['status']='DOWNLOADING';j['worker_id']=payload.worker_id or j.get('worker_id','')
+    j['creation_id']=payload.creation_id or j.get('creation_id','');j['note']='OpenArt 결과를 Bridge에 저장 중'
+    save_openart_job(j)
+    filename=f"{job_id}_{sanitize_openart_filename(j.get('output_filename') or 'output.mp4')}"
+    target=OPENART_RESULTS_DIR/filename
+    try:
+        size=download_openart_result(payload.result_url,target)
+    except Exception as e:
+        j['status']='FAILED';j['error']=f'Result download failed: {type(e).__name__}: {e}';j['note']=j['error'];save_openart_job(j)
+        raise HTTPException(status_code=502,detail=j['error'])
+    public=f'{PUBLIC_BASE_URL}/openart-files/{urllib.parse.quote(filename)}' if PUBLIC_BASE_URL else f'/openart-files/{urllib.parse.quote(filename)}'
+    j['status']='COMPLETED';j['source_result_url']=payload.result_url;j['stored_filename']=filename
+    j['stored_result_url']=public;j['result_bytes']=size;j['metadata']=payload.metadata or {}
+    j['note']=payload.note or 'OpenArt 생성 및 Bridge 저장 완료';j['completed_at']=datetime.now().isoformat(timespec='seconds')
+    j.pop('lease_expires_ts',None);save_openart_job(j)
+    return {'ok':True,'status':'COMPLETED','result_url':public,'result_bytes':size}
+
+@app.post('/openart-jobs/{job_id}/fail')
+def fail_openart_job(job_id:str,payload:OpenArtFailRequest,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id)
+    j['status']='FAILED';j['worker_id']=payload.worker_id or j.get('worker_id','')
+    j['creation_id']=payload.creation_id or j.get('creation_id','');j['error']=payload.error;j['note']=payload.note or payload.error
+    j.pop('lease_expires_ts',None);save_openart_job(j);return {'ok':True,'status':'FAILED'}
+
+@app.post('/openart-jobs/{job_id}/cancel')
+def cancel_openart_job(job_id:str,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);j=load_openart_job(job_id)
+    status=str(j.get('status') or '').upper()
+    if status in {'COMPLETED','FAILED','CANCELLED'}:
+        return {'ok':True,'status':status,'note':j.get('note','')}
+    # The official CLI surface does not expose a documented creation-cancel
+    # command. Cancellation is therefore guaranteed only before submission.
+    if status in {'RUNNING','DOWNLOADING'} or j.get('creation_id'):
+        raise HTTPException(
+            status_code=409,
+            detail='OpenArt generation already started; credits may already be in use and cancellation cannot be guaranteed. The result will be saved when finished.'
+        )
+    j['status']='CANCELLED';j['note']='OpenArt 제출 전 사용자 취소'
+    j.pop('lease_expires_ts',None);save_openart_job(j)
+    return {'ok':True,'status':'CANCELLED','note':j['note']}
+
+@app.post('/openart-worker/heartbeat')
+def openart_worker_heartbeat(payload:OpenArtWorkerHeartbeat,authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization)
+    state=save_openart_worker_state(payload.model_dump() if hasattr(payload,'model_dump') else payload.dict())
+    return {'ok':True,'updated_at':state['updated_at']}
+
+@app.get('/openart-worker/status')
+def openart_worker_status(authorization:Optional[str]=Header(default=None)):
+    check_auth(authorization);state=parse_openart_worker_state();updated=float(state.get('updated_ts') or 0)
+    state['online']=bool(updated and time.time()-updated<=OPENART_WORKER_OFFLINE_SECONDS)
+    return state
+
 @app.on_event('startup')
 def startup_event():
     cleanup_old_jobs()
+    cleanup_old_openart_jobs()
+    requeue_expired_openart_jobs()
     recover_interrupted_jobs_on_startup()
     requeue_expired_video_jobs()
 
@@ -1060,7 +1389,7 @@ def version():
         'direct_drive_recommended':True,
         'selective_image_jobs':True,
         'qa_only_jobs':True,
-        'prompt_only_jobs':True,
+        'prompt_only_jobs':True,'openart_auto_queue':True,
         'video_queue_enabled':ENABLE_VIDEO_QUEUE,
         'default_queue_video_job':DEFAULT_QUEUE_VIDEO
     }
@@ -1078,7 +1407,7 @@ def auth_check(authorization:Optional[str]=Header(default=None)):
         'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
         'video_queue_enabled':ENABLE_VIDEO_QUEUE,'auto_recover_interrupted_jobs':AUTO_RECOVER_INTERRUPTED_JOBS,
         'last_image_error':LAST_IMAGE_ERROR,'last_job_error':LAST_JOB_ERROR,
-        'message':'Bridge token authentication succeeded'
+        'openart_queue_enabled':ENABLE_OPENART_QUEUE,'message':'Bridge token authentication succeeded'
     }
 
 @app.get('/openai-check')
@@ -1087,7 +1416,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v82',
+        'server_version':'v83',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -1157,6 +1486,15 @@ def health():
         except Exception:
             pass
 
+    openart_counts={'QUEUED':0,'CLAIMED':0,'RUNNING':0,'DOWNLOADING':0,'COMPLETED':0,'FAILED':0,'CANCELLED':0}
+    for p in OPENART_JOBS_DIR.glob('*.json'):
+        try:
+            st=str(read_json_file(p).get('status') or '').upper()
+            openart_counts[st]=openart_counts.get(st,0)+1
+        except Exception:pass
+    worker=parse_openart_worker_state();worker_ts=float(worker.get('updated_ts') or 0)
+    worker['online']=bool(worker_ts and time.time()-worker_ts<=OPENART_WORKER_OFFLINE_SECONDS)
+
     return {
         'ok':True,
         'server_version':SYSTEM_VERSION,
@@ -1178,6 +1516,14 @@ def health():
         'last_image_error':LAST_IMAGE_ERROR,'last_job_error':LAST_JOB_ERROR,
         'jobs_total':job_count,'jobs_processing':processing,'jobs_failed_or_review':failed,
         'jobs_interrupted':interrupted,
+        'openart_queue_enabled':ENABLE_OPENART_QUEUE,
+        'openart_queued':openart_counts.get('QUEUED',0),
+        'openart_running':openart_counts.get('CLAIMED',0)+openart_counts.get('RUNNING',0)+openart_counts.get('DOWNLOADING',0),
+        'openart_completed':openart_counts.get('COMPLETED',0),
+        'openart_failed':openart_counts.get('FAILED',0),
+        'openart_cancelled':openart_counts.get('CANCELLED',0),
+        'openart_worker':worker,
+        'openart_storage_warning':'' if STORAGE_PERSISTENT else 'Bridge Persistent Disk 권장: OpenArt 요청/결과가 재배포 시 유실될 수 있습니다.',
         'video_waiting':waiting,'video_rendering':rendering
     }
 
