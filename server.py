@@ -1,10 +1,10 @@
 """
-2060 SOUND ARCHIVE - GPT Bridge Server v78 STABLE INTEGRATED FINAL
+2060 SOUND ARCHIVE - GPT Bridge Server v82 AI IMAGE WORKFLOW
 """
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 from uuid import uuid4
 from datetime import datetime
@@ -14,7 +14,7 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI=None
-SYSTEM_VERSION='v78'
+SYSTEM_VERSION='v82'
 RUNTIME_ID=uuid4().hex
 DATA_DIR_ENV=os.getenv('AI_BRIDGE_DATA_DIR','').strip()
 APP_DIR=Path(DATA_DIR_ENV or './ai_bridge_data').resolve(); APP_DIR.mkdir(parents=True,exist_ok=True)
@@ -52,16 +52,63 @@ LAST_IMAGE_ERROR=''
 LAST_JOB_ERROR=''
 JSON_LOCK=threading.RLock()
 client=OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v78')
+app=FastAPI(title='2060 SOUND ARCHIVE GPT Bridge v82')
 app.mount('/files',StaticFiles(directory=str(IMAGES_DIR)),name='files')
 
 class JobRequest(BaseModel):
-    record:str; title:str; message:Optional[str]=''; story:Optional[str]=''; genre:Optional[str]=''; mood:Optional[str]=''; vocal:Optional[str]=''; symbol:Optional[str]=''; thumb_composition:Optional[str]=''; source_title:Optional[str]=''; source_url:Optional[str]=''; source_genre:Optional[str]=''; song_type:Optional[str]=''; target_character:Optional[str]='';
-    visual_concept:Optional[str]=''; character_lock:Optional[str]=''; background_style:Optional[str]=''; negative_elements:Optional[str]=''; base_image_rules:Optional[str]='';
-    thumbnail_boost:Optional[str]=''; scene_boost:Optional[str]=''; intro_boost:Optional[str]=''; verse_boost:Optional[str]=''; pre_boost:Optional[str]=''; chorus_boost:Optional[str]=''; bridge_boost:Optional[str]=''; final_boost:Optional[str]=''; outro_boost:Optional[str]='';
-    character_reference_url:Optional[str]=''; character_reference_b64:Optional[str]=''; character_reference_mime:Optional[str]=''; character_reference_name:Optional[str]='';
-    quality_check:bool=True; quality_threshold:int=82; max_regenerations:int=1;
-    requested_by:Optional[str]=''; job_type:Optional[str]='텍스트+이미지+영상'; generate_thumbnail:bool=True; generate_motion_prompts:bool=True; queue_video_job:Optional[bool]=None; force_new:bool=False
+    record:str
+    title:str
+    message:Optional[str]=''
+    story:Optional[str]=''
+    genre:Optional[str]=''
+    mood:Optional[str]=''
+    vocal:Optional[str]=''
+    symbol:Optional[str]=''
+    thumb_composition:Optional[str]=''
+    source_title:Optional[str]=''
+    source_url:Optional[str]=''
+    source_genre:Optional[str]=''
+    song_type:Optional[str]=''
+    target_character:Optional[str]=''
+
+    visual_concept:Optional[str]=''
+    character_lock:Optional[str]=''
+    background_style:Optional[str]=''
+    negative_elements:Optional[str]=''
+    base_image_rules:Optional[str]=''
+    thumbnail_boost:Optional[str]=''
+    scene_boost:Optional[str]=''
+    intro_boost:Optional[str]=''
+    verse_boost:Optional[str]=''
+    pre_boost:Optional[str]=''
+    chorus_boost:Optional[str]=''
+    bridge_boost:Optional[str]=''
+    final_boost:Optional[str]=''
+    outro_boost:Optional[str]=''
+
+    character_reference_url:Optional[str]=''
+    character_reference_b64:Optional[str]=''
+    character_reference_mime:Optional[str]=''
+    character_reference_name:Optional[str]=''
+
+    quality_check:bool=True
+    quality_threshold:int=82
+    max_regenerations:int=1
+
+    # v82 task routing
+    task_scope:Optional[str]='FULL'
+    target_scenes:List[str]=Field(default_factory=list)
+    existing_images:Dict[str,Dict[str,str]]=Field(default_factory=dict)
+    generate_thumbnail:bool=True
+    generate_scenes:bool=True
+    generate_motion_prompts:bool=True
+    generate_description:bool=False
+
+    requested_by:Optional[str]=''
+    job_type:Optional[str]='AI_IMAGE'
+    queue_video_job:Optional[bool]=None
+    force_new:bool=False
+
 class VideoCompleteRequest(BaseModel):
     mv_video_url:str; short_hook_url:Optional[str]=''; short_chorus_url:Optional[str]=''; short_final_url:Optional[str]=''; note:Optional[str]=''
 class VideoFailRequest(BaseModel):
@@ -300,6 +347,86 @@ def safe_ext_from_mime(mime,name=''):
     if 'webp' in m or n.endswith('.webp'):return '.webp'
     return '.png'
 
+SCENE_KEYS=['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']
+ALL_IMAGE_KEYS=['THUMBNAIL']+SCENE_KEYS
+
+SCOPE_LABELS={
+    'FULL':'전체 이미지',
+    'THUMBNAIL_ONLY':'썸네일만',
+    'SCENES_ALL':'장면 이미지 7장',
+    'SELECTED_SCENES':'선택 장면',
+    'QA_ONLY':'QA만 다시 검사',
+    'REGENERATE_FAILED':'QA 실패 장면 재생성',
+    'PROMPTS_ONLY':'프롬프트만 갱신'
+}
+
+def normalize_scene_key(value):
+    s=re.sub(r'[^A-Z0-9]','',str(value or '').upper())
+    aliases={
+        'THUMB':'THUMBNAIL','THUMBNAIL':'THUMBNAIL',
+        'INTRO':'INTRO','VERSE':'VERSE',
+        'PRE':'PRE','PRECHORUS':'PRE',
+        'CHORUS':'CHORUS','BRIDGE':'BRIDGE',
+        'FINAL':'FINAL','FINALCHORUS':'FINAL',
+        'OUTRO':'OUTRO'
+    }
+    return aliases.get(s,'')
+
+def normalize_scope(value):
+    s=re.sub(r'[^A-Z0-9]','_',str(value or 'FULL').upper()).strip('_')
+    aliases={
+        'FULL':'FULL','ALL':'FULL','ALL_IMAGES':'FULL',
+        'THUMBNAIL':'THUMBNAIL_ONLY','THUMBNAIL_ONLY':'THUMBNAIL_ONLY',
+        'SCENES':'SCENES_ALL','SCENES_ALL':'SCENES_ALL','ALL_SCENES':'SCENES_ALL',
+        'SELECTED':'SELECTED_SCENES','SELECTED_SCENES':'SELECTED_SCENES',
+        'QA':'QA_ONLY','QA_ONLY':'QA_ONLY',
+        'REGENERATE_FAILED':'REGENERATE_FAILED','FAILED_ONLY':'REGENERATE_FAILED',
+        'PROMPTS':'PROMPTS_ONLY','PROMPTS_ONLY':'PROMPTS_ONLY'
+    }
+    return aliases.get(s,'FULL')
+
+def resolve_targets(d):
+    scope=normalize_scope(d.task_scope)
+    supplied=[]
+    for value in (d.target_scenes or []):
+        key=normalize_scene_key(value)
+        if key and key not in supplied:supplied.append(key)
+
+    if scope=='FULL':return ['THUMBNAIL']+SCENE_KEYS
+    if scope=='THUMBNAIL_ONLY':return ['THUMBNAIL']
+    if scope=='SCENES_ALL':return list(SCENE_KEYS)
+    if scope in ('SELECTED_SCENES','REGENERATE_FAILED'):
+        return supplied
+    if scope=='QA_ONLY':
+        return supplied or [normalize_scene_key(k) for k in (d.existing_images or {}).keys() if normalize_scene_key(k)]
+    return []
+
+def prepare_existing_images(d):
+    paths={};urls={};errors={}
+    for raw_key,payload in (d.existing_images or {}).items():
+        key=normalize_scene_key(raw_key)
+        if not key or not isinstance(payload,dict):continue
+        try:
+            raw=None
+            mime=str(payload.get('mime') or 'image/png')
+            name=str(payload.get('name') or f'{key}.png')
+            if payload.get('b64'):
+                raw=base64.b64decode(payload.get('b64'))
+            elif payload.get('url'):
+                req=urllib.request.Request(str(payload.get('url')),headers={'User-Agent':'Mozilla/5.0'})
+                with urllib.request.urlopen(req,timeout=45) as resp:
+                    raw=resp.read()
+                    mime=resp.headers.get_content_type() or mime
+            if not raw:raise ValueError('empty image payload')
+            ext=safe_ext_from_mime(mime,name)
+            path=IMAGES_DIR/f'{d.record}_existing_{key}{ext}'
+            path.write_bytes(raw)
+            paths[key]=path
+            urls[key]=f'{PUBLIC_BASE_URL}/files/{path.name}' if PUBLIC_BASE_URL else ''
+        except Exception as e:
+            errors[key]=f'{type(e).__name__}: {e}'
+    return paths,urls,errors
+
 def prepare_character_reference(d):
     if not PUBLIC_BASE_URL:
         return None,''
@@ -362,7 +489,7 @@ def gen_image(p,record,suffix='thumbnail',reference_path=None):
         item=r.data[0]
         b64=getattr(item,'b64_json',None)
         remote_url=getattr(item,'url',None)
-        fn=f'{record}_{suffix}.png'
+        fn=f'{record}_{suffix}_{uuid4().hex[:10]}.png'
         target=IMAGES_DIR/fn
         if b64:
             target.write_bytes(base64.b64decode(b64))
@@ -549,115 +676,218 @@ def gen_scene_images(d,sp,reference_path=None,reference_url=''):
         quality[key]=qa
     return urls,errors,quality,regen_total
 
+def generate_selected_images(d,scope,targets,tp,sp,reference_path=None,reference_url=''):
+    thumb='';thumb_error='';thumb_quality={};thumb_retries=0
+    scene_urls={};scene_errors={};scene_quality={};scene_regens=0
+
+    if 'THUMBNAIL' in targets:
+        thumb,thumb_error,thumb_quality,thumb_retries=generate_with_qa(
+            d,tp,'thumbnail','THUMBNAIL',reference_path,reference_url
+        )
+
+    consistency_ref=reference_url
+    for key in [x for x in SCENE_KEYS if x in targets]:
+        if not ENABLE_SCENE_IMAGE_GEN:
+            scene_errors[key]='ENABLE_SCENE_IMAGE_GEN=false'
+            scene_quality[key]={'score':None,'pass':False,'issues':['scene generation disabled'],'regeneration_instruction':'','qa_error':'scene generation disabled'}
+            continue
+        prompt=scene_image_prompt(d,key,sp.get(key,''))
+        url,error,qa,retries=generate_with_qa(
+            d,prompt,f'scene_{key}',key,reference_path,consistency_ref
+        )
+        scene_regens+=retries
+        if url:
+            scene_urls[key]=url
+            if not consistency_ref and key=='INTRO':consistency_ref=url
+        if error:scene_errors[key]=error
+        scene_quality[key]=qa
+
+    return {
+        'thumbnail_url':thumb,'thumbnail_error':thumb_error,
+        'thumbnail_quality':thumb_quality,'thumbnail_retries':thumb_retries,
+        'scene_urls':scene_urls,'scene_errors':scene_errors,
+        'scene_quality':scene_quality,'scene_regens':scene_regens
+    }
+
+def qa_existing_images(d,targets,existing_urls,tp,sp,reference_url=''):
+    quality={};errors={}
+    for key in targets:
+        url=existing_urls.get(key,'')
+        if not url:
+            errors[key]='existing image missing'
+            quality[key]={'score':0.0,'pass':False,'issues':['Existing image missing'],'regeneration_instruction':'Provide the existing image before QA.','qa_error':'Existing image missing'}
+            continue
+        expected=tp if key=='THUMBNAIL' else scene_image_prompt(d,key,sp.get(key,''))
+        quality[key]=quality_check_image(url,d,key,expected,reference_url)
+    return quality,errors
+
+def build_quality_summary(d,quality_report):
+    numeric=[float(v['score']) for v in quality_report.values() if isinstance(v,dict) and v.get('score') is not None]
+    average=round(sum(numeric)/len(numeric),1) if numeric else None
+    failed=[k for k,v in quality_report.items() if isinstance(v,dict) and not v.get('pass',True)]
+    qa_errors=[k for k,v in quality_report.items() if isinstance(v,dict) and v.get('qa_error')]
+    if not d.quality_check:status='미사용'
+    elif failed:status='검토 필요'
+    elif qa_errors:status='검수 오류'
+    else:status='통과'
+    return status,average,failed,qa_errors
+
+def make_progress_text(targets,thumb_url,scene_urls,scope):
+    if scope=='PROMPTS_ONLY':return '프롬프트 완료'
+    thumb_target=1 if 'THUMBNAIL' in targets else 0
+    thumb_done=1 if thumb_url else 0
+    scene_targets=[x for x in targets if x in SCENE_KEYS]
+    scene_done=sum(1 for x in scene_targets if scene_urls.get(x))
+    parts=[]
+    if thumb_target:parts.append(f'썸네일 {thumb_done}/{thumb_target}')
+    if scene_targets:parts.append(f'장면 {scene_done}/{len(scene_targets)}')
+    if scope=='QA_ONLY':parts.append(f'QA {len(targets)}장')
+    return ' · '.join(parts) or '처리 완료'
+
 def _process_job_impl(job_id):
     job=load_job(job_id)
     d=JobRequest(**job['request'])
     d.quality_threshold=max(50,min(100,int(d.quality_threshold or 82)))
     d.max_regenerations=max(0,min(2,int(d.max_regenerations or 0)))
-    job['status']='PROCESSING'; save_job(job)
+    scope=normalize_scope(d.task_scope)
+    targets=resolve_targets(d)
+
+    if scope in ('SELECTED_SCENES','REGENERATE_FAILED') and not targets:
+        raise ValueError('target_scenes is required for selected-scene generation')
+
+    job['status']='PROCESSING'
+    job['task_scope']=scope
+    job['target_scenes']=targets
+    save_job(job)
 
     reference_path,reference_public_url=prepare_character_reference(d)
-    # Do not keep large base64 payload in persistent job JSON after reference was prepared.
-    if isinstance(job.get('request'),dict) and job['request'].get('character_reference_b64'):
+    existing_paths,existing_urls,existing_errors=prepare_existing_images(d)
+
+    # Do not keep large base64 payloads in persistent job JSON.
+    if isinstance(job.get('request'),dict):
         job['request']['character_reference_b64']=''
+        if job['request'].get('existing_images'):
+            compact={}
+            for k,v in (job['request'].get('existing_images') or {}).items():
+                if isinstance(v,dict):compact[k]={'name':v.get('name',''),'mime':v.get('mime','')}
+            job['request']['existing_images']=compact
         save_job(job)
 
-    tp=call_text(thumb_prompt(d))
-    description=call_text(desc_prompt(d))
+    # v82 removes duplicated YouTube-description generation. Gemini owns copywriting.
+    tp=thumb_prompt(d)
     cm=common_motion(d)
     sp=scenes(d)
 
-    thumb=''; thumb_error=''; thumb_qa={'score':None,'pass':True,'issues':[],'regeneration_instruction':'','qa_error':''}; thumb_retries=0
-    if d.generate_thumbnail:
-        thumb,thumb_error,thumb_qa,thumb_retries=generate_with_qa(d,tp,'thumbnail','THUMBNAIL',reference_path,reference_public_url)
+    thumb='';thumb_error='';scene_urls={};scene_errors={};quality_report={};regen_total=0
 
-    scene_urls,scene_errors,scene_quality,scene_regens=gen_scene_images(d,sp,reference_path,reference_public_url)
-    generated_count=len(scene_urls)
-    regen_total=thumb_retries+scene_regens
-
-    quality_report={'THUMBNAIL':thumb_qa,**scene_quality}
-    numeric_scores=[float(v['score']) for v in quality_report.values() if isinstance(v,dict) and v.get('score') is not None]
-    quality_average=round(sum(numeric_scores)/len(numeric_scores),1) if numeric_scores else None
-    failed_quality=[k for k,v in quality_report.items() if isinstance(v,dict) and not v.get('pass',True)]
-    qa_errors=[k for k,v in quality_report.items() if isinstance(v,dict) and v.get('qa_error')]
-    if not d.quality_check:
-        quality_status='미사용'
-    elif failed_quality:
-        quality_status='검토 필요'
-    elif qa_errors:
-        quality_status='검수 오류'
+    if scope=='PROMPTS_ONLY':
+        pass
+    elif scope=='QA_ONLY':
+        quality_report,qa_input_errors=qa_existing_images(
+            d,targets,existing_urls,tp,sp,reference_public_url
+        )
+        scene_errors.update(existing_errors)
+        scene_errors.update(qa_input_errors)
     else:
-        quality_status='통과'
+        generated=generate_selected_images(
+            d,scope,targets,tp,sp,reference_path,reference_public_url
+        )
+        thumb=generated['thumbnail_url']
+        thumb_error=generated['thumbnail_error']
+        scene_urls=generated['scene_urls']
+        scene_errors=generated['scene_errors']
+        regen_total=generated['thumbnail_retries']+generated['scene_regens']
+        if 'THUMBNAIL' in targets:
+            quality_report['THUMBNAIL']=generated['thumbnail_quality']
+        quality_report.update(generated['scene_quality'])
+
+    quality_status,quality_average,failed_quality,qa_errors=build_quality_summary(d,quality_report)
 
     err_parts=[]
     if thumb_error:err_parts.append('THUMB: '+thumb_error)
-    if scene_errors:
-        for k,v in list(scene_errors.items())[:3]:err_parts.append(f'{k}: {v}')
-        if len(scene_errors)>3:err_parts.append(f'+{len(scene_errors)-3} more')
+    for k,v in list(scene_errors.items())[:5]:err_parts.append(f'{k}: {v}')
+    if len(scene_errors)>5:err_parts.append(f'+{len(scene_errors)-5} more')
     err_summary=' | '.join(err_parts)
 
+    target_scene_keys=[x for x in targets if x in SCENE_KEYS]
+    completed_targets=[]
+    if 'THUMBNAIL' in targets and thumb:completed_targets.append('THUMBNAIL')
+    completed_targets += [x for x in target_scene_keys if scene_urls.get(x)]
+
+    progress=make_progress_text(targets,thumb,scene_urls,scope)
     result={
-        'thumbnail_prompt':tp,'thumbnail_image_url':thumb,'generated_description':description,
-        'common_motion_prompt':cm,'scene_prompts':sp,'scene_image_urls':scene_urls,
-        'scene_image_errors':scene_errors,'scene_images_generated':generated_count,
+        'task_scope':scope,
+        'task_scope_label':SCOPE_LABELS.get(scope,scope),
+        'target_scenes':targets,
+        'completed_targets':completed_targets,
+        'image_progress':progress,
+        'thumbnail_prompt':tp if scope!='QA_ONLY' else '',
+        'thumbnail_image_url':thumb,
+        'generated_description':'',
+        'common_motion_prompt':cm if d.generate_motion_prompts else '',
+        'scene_prompts':sp if d.generate_motion_prompts else {},
+        'scene_image_urls':scene_urls,
+        'scene_image_errors':scene_errors,
+        'scene_images_generated':len(scene_urls),
         'image_errors_summary':err_summary[:1500],
         'character_reference_url':reference_public_url,
-        'image_quality_status':quality_status,'image_quality_average':quality_average,
-        'image_regenerations':regen_total,'image_quality_report':quality_report,
+        'image_quality_status':quality_status,
+        'image_quality_average':quality_average,
+        'image_regenerations':regen_total,
+        'image_quality_report':quality_report,
         'quality_failed_scenes':failed_quality,
         'mv_prompt_status':'완료' if d.generate_motion_prompts else '',
-        'mv_video_url':'','short_hook_url':'','short_chorus_url':'','short_final_url':'','note':''
+        'mv_video_url':'','short_hook_url':'','short_chorus_url':'','short_final_url':'',
+        'note':''
     }
     job['result']=result
 
-    # v64 hard safety gates: image generation must be complete before QA/video queue.
-    expected_thumb_ok=(not d.generate_thumbnail) or bool(thumb)
-    all_scenes_ok=(generated_count==7 and not scene_errors)
-    image_generation_block=bool((not expected_thumb_ok) or (not all_scenes_ok) or thumb_error)
-    quality_block=bool(d.quality_check and (failed_quality or qa_errors))
+    expected_count=len(targets)
+    generated_or_qa_count=(len(completed_targets) if scope!='QA_ONLY' else len(quality_report))
+    generation_block=bool(scope not in ('QA_ONLY','PROMPTS_ONLY') and (generated_or_qa_count!=expected_count or thumb_error or scene_errors))
+    quality_block=bool(d.quality_check and scope!='PROMPTS_ONLY' and (failed_quality or qa_errors))
 
-    if image_generation_block or quality_block:
-        try:
-            qp=queue_path(job_id)
-            if qp.exists():qp.unlink()
-        except Exception:
-            pass
+    if generation_block or quality_block:
+        delete_video_queue(job_id)
 
-    if image_generation_block:
+    if generation_block:
         job['status']='IMAGE_ERROR'
-        missing=[]
-        if d.generate_thumbnail and not thumb:missing.append('THUMBNAIL')
-        for k in ['INTRO','VERSE','PRE','CHORUS','BRIDGE','FINAL','OUTRO']:
-            if not scene_urls.get(k):missing.append(k)
+        missing=[x for x in targets if x not in completed_targets]
         result['quality_failed_scenes']=list(dict.fromkeys((failed_quality or [])+missing))
         result['image_quality_status']='검수 불가'
-        result['note']=f'이미지 생성 실패 / 장면 이미지 {generated_count}/7 / Colab Worker 보류'
+        result['note']=f'{SCOPE_LABELS.get(scope,scope)} 실패 / {progress}'
         if missing:result['note']+=' / 누락: '+', '.join(missing)
-        if err_summary:result['note']+=' / 이미지 오류: '+err_summary[:900]
+        if err_summary:result['note']+=' / 오류: '+err_summary[:900]
     elif quality_block:
         job['status']='QUALITY_REVIEW'
         reason=list(dict.fromkeys((failed_quality or [])+(qa_errors or [])))
         result['quality_failed_scenes']=reason
-        result['note']='이미지 QA 통과 실패: '+', '.join(reason)+f' / 평균 {quality_average if quality_average is not None else "-"}점 / 자동 재생성 {regen_total}회. 3D 영상 변환은 보류했습니다.'
-    elif should_queue_video(d):
+        result['note']=f'{SCOPE_LABELS.get(scope,scope)} QA 검토 필요: '+', '.join(reason)
+        if quality_average is not None:result['note']+=f' / 평균 {quality_average:.1f}점'
+        if regen_total:result['note']+=f' / 자동 재생성 {regen_total}회'
+    elif scope=='FULL' and should_queue_video(d):
         q={
-            'job_id':job_id,'record':d.record,'title':d.title,'common_motion_prompt':cm,
-            'scene_prompts':sp,'scene_image_urls':scene_urls,'scene_image_errors':scene_errors,
-            'scene_images_generated':generated_count,'image_quality_status':quality_status,
-            'image_quality_average':quality_average,'image_regenerations':regen_total,
-            'created_at':datetime.now().isoformat(timespec='seconds'),'status':'WAITING_VIDEO'
+            'job_id':job_id,'record':d.record,'title':d.title,
+            'common_motion_prompt':cm,'scene_prompts':sp,
+            'scene_image_urls':scene_urls,'scene_image_errors':scene_errors,
+            'scene_images_generated':len(scene_urls),
+            'image_quality_status':quality_status,
+            'image_quality_average':quality_average,
+            'image_regenerations':regen_total,
+            'created_at':datetime.now().isoformat(timespec='seconds'),
+            'status':'WAITING_VIDEO'
         }
         save_video_queue(q)
         job['status']='WAITING_VIDEO'
-        result['note']=f'프롬프트 완료 / 장면 이미지 7/7 / QA {quality_status}'
-        if quality_average is not None:result['note']+=f' {quality_average:.0f}점'
-        if regen_total:result['note']+=f' / 자동 재생성 {regen_total}회'
-        result['note']+=' / Colab Worker 대기'
+        result['note']=f'전체 이미지 완료 / {progress} / QA {quality_status} / Colab Worker 대기'
     else:
         job['status']='DONE'
-        result['note']=f'텍스트/이미지 완료 / 장면 이미지 {generated_count}/7 / QA {quality_status} / Direct Drive 렌더 준비'
-        if bool(getattr(d,'queue_video_job',False)) and not ENABLE_VIDEO_QUEUE:
-            result['note']+=' / Bridge 영상큐는 환경설정에서 OFF'
+        result['note']=f'{SCOPE_LABELS.get(scope,scope)} 완료 / {progress}'
+        if scope!='PROMPTS_ONLY':
+            result['note']+=f' / QA {quality_status}'
+            if quality_average is not None:result['note']+=f' {quality_average:.1f}점'
+            if regen_total:result['note']+=f' / 자동 재생성 {regen_total}회'
+        if scope=='FULL':result['note']+=' / Direct Drive 렌더 준비'
     save_job(job)
 
 def process_job(job_id):
@@ -687,12 +917,15 @@ def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=Non
         if not payload.force_new:
             existing=find_active_job(payload.record)
             if existing:
-                return {
-                    'job_id':existing['job_id'],
-                    'status':'전송완료',
-                    'reused':True,
-                    'note':'같은 곡의 진행 중 Job을 재사용했습니다.'
-                }
+                existing_scope=normalize_scope((existing.get('request') or {}).get('task_scope','FULL'))
+                requested_scope=normalize_scope(payload.task_scope)
+                if existing_scope==requested_scope:
+                    return {
+                        'job_id':existing['job_id'],
+                        'status':'전송완료',
+                        'reused':True,
+                        'note':'같은 곡·작업 범위의 진행 중 Job을 재사용했습니다.'
+                    }
         jid=uuid4().hex
         request_data=payload.model_dump() if hasattr(payload,'model_dump') else payload.dict()
         request_data['queue_video_job']=should_queue_video(payload)
@@ -715,6 +948,11 @@ def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
     return {
         'job_id':j['job_id'],'status':j['status'],'server_version':SYSTEM_VERSION,
         'runtime_id':str(j.get('runtime_id') or '')[:8],
+        'task_scope':r.get('task_scope',(j.get('request') or {}).get('task_scope','FULL')),
+        'task_scope_label':r.get('task_scope_label',''),
+        'target_scenes':r.get('target_scenes',[]),
+        'completed_targets':r.get('completed_targets',[]),
+        'image_progress':r.get('image_progress',''),
         'queue_video_job':bool((j.get('request') or {}).get('queue_video_job',False)),
         'thumbnail_prompt':r.get('thumbnail_prompt',''),'thumbnail_image_url':r.get('thumbnail_image_url',''),
         'generated_description':r.get('generated_description',''),'common_motion_prompt':r.get('common_motion_prompt',''),
@@ -820,6 +1058,9 @@ def version():
         'server_version':SYSTEM_VERSION,
         'runtime_id':RUNTIME_ID[:8],
         'direct_drive_recommended':True,
+        'selective_image_jobs':True,
+        'qa_only_jobs':True,
+        'prompt_only_jobs':True,
         'video_queue_enabled':ENABLE_VIDEO_QUEUE,
         'default_queue_video_job':DEFAULT_QUEUE_VIDEO
     }
@@ -831,6 +1072,7 @@ def auth_check(authorization:Optional[str]=Header(default=None)):
         'ok':True,'authenticated':True,'server_version':SYSTEM_VERSION,
         'bridge_token_set':bool(BRIDGE_TOKEN),'bridge_token_length':len(BRIDGE_TOKEN),
         'openai_key_set':bool(OPENAI_API_KEY),'openai_client_ready':bool(client),
+        'selective_image_jobs':True,'qa_only_jobs':True,'prompt_only_jobs':True,
         'storage_persistent':STORAGE_PERSISTENT,'persistent_storage':STORAGE_PERSISTENT,
         'persistent_storage_configured':STORAGE_PERSISTENT,'data_dir':str(APP_DIR),
         'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
@@ -845,7 +1087,7 @@ def openai_check(authorization:Optional[str]=Header(default=None)):
 
     result={
         'ok':False,
-        'server_version':'v78',
+        'server_version':'v82',
         'model':TEXT_MODEL,
         'openai_key_set':bool(OPENAI_API_KEY),
         'openai_client_ready':bool(client),
@@ -922,7 +1164,7 @@ def health():
         'openai_key_set':bool(OPENAI_API_KEY),'openai_client_ready':bool(client),
         'image_generation':ENABLE_IMAGE_GEN,'scene_image_generation':ENABLE_SCENE_IMAGE_GEN,
         'character_reference_support':True,'image_quality_check_support':True,
-        'strict_image_gate':True,'strict_anatomy_gate':True,'two_pass_image_qa':True,
+        'strict_image_gate':True,'strict_anatomy_gate':True,'two_pass_image_qa':True,'selective_image_jobs':True,'qa_only_jobs':True,'prompt_only_jobs':True,
         'direct_drive_recommended':True,'direct_drive_mode':True,
         'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
         'video_queue_enabled':ENABLE_VIDEO_QUEUE,'auto_recover_interrupted_jobs':AUTO_RECOVER_INTERRUPTED_JOBS,
