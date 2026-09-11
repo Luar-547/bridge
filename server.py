@@ -15,7 +15,7 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI=None
-SYSTEM_VERSION='v83'
+SYSTEM_VERSION='v83-existing-prompts-1'
 RUNTIME_ID=uuid4().hex
 DATA_DIR_ENV=os.getenv('AI_BRIDGE_DATA_DIR','').strip()
 APP_DIR=Path(DATA_DIR_ENV or './ai_bridge_data').resolve(); APP_DIR.mkdir(parents=True,exist_ok=True)
@@ -111,6 +111,11 @@ class JobRequest(BaseModel):
     task_scope:Optional[str]='FULL'
     target_scenes:List[str]=Field(default_factory=list)
     existing_images:Dict[str,Dict[str,str]]=Field(default_factory=dict)
+    # Existing source text is an image prompt, never a motion-prompt template.
+    # Omitted prompt_source preserves the v83 generated-prompt behavior.
+    prompt_source:str='GENERATED'
+    thumbnail_prompt:str=''
+    scene_image_prompts:Dict[str,str]=Field(default_factory=dict)
     generate_thumbnail:bool=True
     generate_scenes:bool=True
     generate_motion_prompts:bool=True
@@ -492,6 +497,12 @@ def thumb_prompt(d):
 def desc_prompt(d):return 'Write a concise Korean YouTube music description. Use 3-5 short paragraphs, emotional and music-first. Do not invent facts. If CrackAI source exists, mention this is an OST-like/concept song based on it. '+context(d)
 
 def common_motion(d):
+    if uses_existing_image_prompts(d):
+        return ' '.join([
+            'Animate the supplied source image. Preserve its exact subjects, face, hairstyle, outfit, accessories, body proportions, setting, lighting, and color palette.',
+            'Use smooth cinematic camera motion, subtle breathing and blinking when appropriate, gentle hair and cloth movement, and parallax depth.',
+            'Do not redesign the source image, introduce new characters or objects, or change anatomy.'
+        ])
     return ' '.join([
         'The same adult character from the reference image. Preserve the exact face, hairstyle, outfit, accessories, body proportions, and color palette.',
         'Create cinematic 3D-like motion with realistic movement, subtle breathing, blinking, hair physics, cloth physics, parallax depth, and smooth camera motion.',
@@ -511,6 +522,9 @@ def scenes(d):
         'FINAL':'Final chorus climax. Highest emotional energy, luminous character, dynamic hair and cloth, hero composition.',
         'OUTRO':'Outro resolution. Slower softer motion, easing camera, emotional afterglow.'
     }
+    if uses_existing_image_prompts(d):
+        return {k:' '.join([c,v,'Source image description: '+d.scene_image_prompts[k]]).strip()
+                for k,v in s.items() if k in d.scene_image_prompts}
     return {k:' '.join([c,v,scene_boost_for(d,k)]).strip() for k,v in s.items()}
 def call_text(p):
     if not client:return p
@@ -579,6 +593,38 @@ def resolve_targets(d):
         return supplied or [normalize_scene_key(k) for k in (d.existing_images or {}).keys() if normalize_scene_key(k)]
     return []
 
+def uses_existing_image_prompts(d):
+    return str(d.prompt_source or 'GENERATED').strip().upper()=='EXISTING'
+
+def validate_image_prompt_source(d):
+    """Validate before queueing or paid work; preserve prompt text byte-for-byte."""
+    mode=str(d.prompt_source or 'GENERATED').strip().upper()
+    if mode not in ('GENERATED','EXISTING'):
+        raise ValueError('prompt_source must be GENERATED or EXISTING')
+    d.prompt_source=mode
+    if mode!='EXISTING':return {}
+    prompts={}
+    for raw_key,value in d.scene_image_prompts.items():
+        key=normalize_scene_key(raw_key)
+        if key not in SCENE_KEYS:
+            raise ValueError('Unknown scene_image_prompts key: '+str(raw_key))
+        if key in prompts and prompts[key]!=value:
+            raise ValueError('Conflicting image prompts for '+key)
+        prompts[key]=value
+    d.scene_image_prompts=prompts
+    for raw_key in d.target_scenes:
+        if not normalize_scene_key(raw_key):
+            raise ValueError('Unknown target_scenes key: '+str(raw_key))
+    targets=resolve_targets(d)
+    scope=normalize_scope(d.task_scope)
+    if scope in ('SELECTED_SCENES','REGENERATE_FAILED','QA_ONLY') and not targets:
+        raise ValueError('target_scenes is required for '+scope)
+    supplied={'THUMBNAIL':d.thumbnail_prompt,**prompts}
+    missing=[key for key in targets if not supplied.get(key,'').strip()]
+    if missing:
+        raise ValueError('Existing image prompt required for: '+', '.join(missing))
+    return {key:supplied[key] for key in targets}
+
 def prepare_existing_images(d):
     paths={};urls={};errors={}
     for raw_key,payload in (d.existing_images or {}).items():
@@ -631,7 +677,7 @@ def prepare_character_reference(d):
         print(f'[REFERENCE ERROR] {d.record}: {type(e).__name__}: {e}',flush=True)
         return None,''
 
-def gen_image(p,record,suffix='thumbnail',reference_path=None):
+def gen_image(p,record,suffix='thumbnail',reference_path=None,preserve_prompt=False):
     global LAST_IMAGE_ERROR
 
     if not ENABLE_IMAGE_GEN:
@@ -654,7 +700,7 @@ def gen_image(p,record,suffix='thumbnail',reference_path=None):
             )
             try:
                 with open(reference_path,'rb') as ref_file:
-                    r=client.images.edit(model=IMAGE_MODEL,image=ref_file,prompt=ref_instruction+p,size='1536x1024')
+                    r=client.images.edit(model=IMAGE_MODEL,image=ref_file,prompt=p if preserve_prompt else ref_instruction+p,size='1536x1024')
             except Exception as edit_error:
                 print(f'[REFERENCE EDIT FALLBACK] {record} {suffix}: {type(edit_error).__name__}: {edit_error}',flush=True)
                 r=None
@@ -798,6 +844,9 @@ def quality_check_image(image_url,d,label,expected_prompt='',reference_url=''):
     }
 
 def scene_image_prompt(d,scene,motion_prompt):
+    if uses_existing_image_prompts(d):
+        # No generic scene text, boosts, or motion instructions alter source art.
+        return d.scene_image_prompts[scene]
     scene_notes={
         'INTRO':'Opening establishing scene, wide shot, calm world introduction and atmospheric depth.',
         'VERSE':'Narrative medium shot, natural pose, emotional storytelling, moderate energy.',
@@ -824,7 +873,10 @@ def generate_with_qa(d,prompt,suffix,label,reference_path=None,reference_url='')
     for attempt in range(max_retry+1):
         attempts=attempt
         unique_suffix=suffix if attempt==0 else f'{suffix}_retry{attempt}'
-        url,error=gen_image(current_prompt,d.record,unique_suffix,reference_path)
+        if uses_existing_image_prompts(d):
+            url,error=gen_image(current_prompt,d.record,unique_suffix,reference_path,preserve_prompt=True)
+        else:
+            url,error=gen_image(current_prompt,d.record,unique_suffix,reference_path)
         final_url,final_error=url,error
         if not url or error:
             break
@@ -832,9 +884,10 @@ def generate_with_qa(d,prompt,suffix,label,reference_path=None,reference_url='')
         if final_qa.get('pass',True):
             break
         if attempt<max_retry:
-            correction=final_qa.get('regeneration_instruction') or '; '.join(final_qa.get('issues') or [])
-            current_prompt=(prompt+' Regenerate this image and correct the following QA issues: '+correction+
-                            ' Preserve character identity and intended composition. Every clearly visible human hand must have exactly five digits total: four fingers and one thumb. No extra, missing, fused, duplicated, forked, or branching fingers. Keep wrists, arms, hands and limbs anatomically natural. No text or watermark.')
+            if not uses_existing_image_prompts(d):
+                correction=final_qa.get('regeneration_instruction') or '; '.join(final_qa.get('issues') or [])
+                current_prompt=(prompt+' Regenerate this image and correct the following QA issues: '+correction+
+                                 ' Preserve character identity and intended composition. Every clearly visible human hand must have exactly five digits total: four fingers and one thumb. No extra, missing, fused, duplicated, forked, or branching fingers. Keep wrists, arms, hands and limbs anatomically natural. No text or watermark.')
             print(f'[QA RETRY] {d.record} {label}: score={final_qa.get("score")} attempt={attempt+1}',flush=True)
     return final_url,final_error,final_qa,attempts
 
@@ -929,6 +982,7 @@ def _process_job_impl(job_id):
     d.max_regenerations=max(0,min(2,int(d.max_regenerations or 0)))
     scope=normalize_scope(d.task_scope)
     targets=resolve_targets(d)
+    used_image_prompts=validate_image_prompt_source(d)
 
     if scope in ('SELECTED_SCENES','REGENERATE_FAILED') and not targets:
         raise ValueError('target_scenes is required for selected-scene generation')
@@ -952,7 +1006,7 @@ def _process_job_impl(job_id):
         save_job(job)
 
     # v82 removes duplicated YouTube-description generation. Gemini owns copywriting.
-    tp=thumb_prompt(d)
+    tp=d.thumbnail_prompt if uses_existing_image_prompts(d) else thumb_prompt(d)
     cm=common_motion(d)
     sp=scenes(d)
 
@@ -995,6 +1049,8 @@ def _process_job_impl(job_id):
     progress=make_progress_text(targets,thumb,scene_urls,scope)
     result={
         'task_scope':scope,
+        'prompt_source':d.prompt_source,
+        'used_image_prompts':used_image_prompts,
         'task_scope_label':SCOPE_LABELS.get(scope,scope),
         'target_scenes':targets,
         'completed_targets':completed_targets,
@@ -1090,6 +1146,10 @@ def process_job(job_id):
 @app.post('/jobs')
 def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=None)):
     check_auth(authorization)
+    try:
+        validate_image_prompt_source(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=422,detail=str(error)) from error
     cleanup_old_jobs()
     with JSON_LOCK:
         if not payload.force_new:
@@ -1097,7 +1157,17 @@ def create_job(payload:JobRequest,authorization:Optional[str]=Header(default=Non
             if existing:
                 existing_scope=normalize_scope((existing.get('request') or {}).get('task_scope','FULL'))
                 requested_scope=normalize_scope(payload.task_scope)
-                if existing_scope==requested_scope:
+                existing_request=existing.get('request') or {}
+                existing_mode=str(existing_request.get('prompt_source') or 'GENERATED').upper()
+                same_prompt_request=(existing_mode==payload.prompt_source)
+                if same_prompt_request and uses_existing_image_prompts(payload):
+                    # A different saved prompt/selection must never reuse stale work.
+                    old_request=JobRequest(**existing_request)
+                    same_prompt_request=(
+                        resolve_targets(old_request)==resolve_targets(payload)
+                        and validate_image_prompt_source(old_request)==validate_image_prompt_source(payload)
+                    )
+                if existing_scope==requested_scope and same_prompt_request:
                     return {
                         'job_id':existing['job_id'],
                         'status':'전송완료',
@@ -1127,6 +1197,8 @@ def get_job(job_id:str,authorization:Optional[str]=Header(default=None)):
         'job_id':j['job_id'],'status':j['status'],'server_version':SYSTEM_VERSION,
         'runtime_id':str(j.get('runtime_id') or '')[:8],
         'task_scope':r.get('task_scope',(j.get('request') or {}).get('task_scope','FULL')),
+        'prompt_source':r.get('prompt_source',(j.get('request') or {}).get('prompt_source','GENERATED')),
+        'used_image_prompts':r.get('used_image_prompts',{}),
         'task_scope_label':r.get('task_scope_label',''),
         'target_scenes':r.get('target_scenes',[]),
         'completed_targets':r.get('completed_targets',[]),
@@ -1388,6 +1460,7 @@ def version():
         'runtime_id':RUNTIME_ID[:8],
         'direct_drive_recommended':True,
         'selective_image_jobs':True,
+        'existing_image_prompts':True,
         'qa_only_jobs':True,
         'prompt_only_jobs':True,'openart_auto_queue':True,
         'video_queue_enabled':ENABLE_VIDEO_QUEUE,
@@ -1402,6 +1475,7 @@ def auth_check(authorization:Optional[str]=Header(default=None)):
         'bridge_token_set':bool(BRIDGE_TOKEN),'bridge_token_length':len(BRIDGE_TOKEN),
         'openai_key_set':bool(OPENAI_API_KEY),'openai_client_ready':bool(client),
         'selective_image_jobs':True,'qa_only_jobs':True,'prompt_only_jobs':True,
+        'existing_image_prompts':True,
         'storage_persistent':STORAGE_PERSISTENT,'persistent_storage':STORAGE_PERSISTENT,
         'persistent_storage_configured':STORAGE_PERSISTENT,'data_dir':str(APP_DIR),
         'default_queue_video':DEFAULT_QUEUE_VIDEO,'default_queue_video_job':DEFAULT_QUEUE_VIDEO,
